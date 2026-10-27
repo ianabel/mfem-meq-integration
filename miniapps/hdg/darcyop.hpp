@@ -1,0 +1,430 @@
+// Copyright (c) 2010-2025, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#ifndef MFEM_HDG_DARCYOP
+#define MFEM_HDG_DARCYOP
+
+#include "mfem.hpp"
+#include "../../general/socketstream.hpp"
+#include <vector>
+#include <variant>
+
+namespace mfem
+{
+namespace hdg
+{
+/// A helper operator for Darcy-like mixed systems
+/** Class DarcyOperator helps with construction of a spatial operator for
+    mixed systems with (anti)symmetric weak form common for parabolic and
+    elliptic problems. These can be written as:
+    \verbatim
+        ┌        ┐┌   ┐   ┌    ┐
+        | Mu ±Bᵀ || u | _ | bu |
+        | B  Mp  || p | ̅  | bp |
+        └        ┘└   ┘   └    ┘
+    \endverbatim
+    following the notation of DarcyForm.
+
+    The mixed system discretization provided through DarcyForm is solved
+    implicitly with an appropriate solver and preconditioner to provide
+    time derivatives for time evolution of the system. Specifically,
+    these configurations are set up:
+    - mixed system - Schur complement preconditioner using Jacobi
+                     preconditioner for the flux mass and HypreBoomerAMG in
+                     parallel for the Schur complement, or UMFPackSolver
+                     / GSSmoother in serial (depending on availability and
+                     @a USE_DIRECT_SOLVER_SCHUR in darcyop.cpp).
+    - hybridized system - HypreBoomerAMG in parallel, or UMFPackSolver
+                          / GSSmoother in serial (depending on availability
+                          and @a USE_DIRECT_SOLVER_HYBRIDIZATION in darcyop.cpp)
+    - reduced system - HypreBoomerAMG in parallel, or UMFPackSolver
+                       / GSSmoother in serial (depending on availability
+                       and @a USE_DIRECT_SOLVER_REDUCTION in darcyop.cpp)
+
+    Note that DarcyOperator uses a BlockVector (with offsets obtained through
+    GetOffsets()) for representation of the state, which has 3 components for
+    hybridized systems: flux, potential and trace unknowns. This construction
+    speeds up the solution procedure by providing an initial guess of the trace
+    unknows to the linear solver.
+
+    DarcyOperator also handles construction of the intertial term in time
+    evolving cases (indicated in the constructor), which is added to the
+    DarcyForm and its contribution is added to the right hand side as well
+    every time step.
+  */
+class DarcyOperator : public TimeDependentOperator
+{
+public:
+   enum class SolverType
+   {
+      Default = 0,
+      LBFGS,
+      LBB,
+      Newton,
+      KINSol,
+   };
+
+   /** @brief Which serial preconditioner to use where the code offers a
+       choice between an iterative smoother and a direct solve.
+
+       The choice used to be made at COMPILE time only, by MFEM_USE_SUITESPARSE
+       together with the USE_DIRECT_SOLVER_* macros in darcyop.cpp, and that is
+       what @a Default still reproduces exactly -- so nothing moves unless a
+       caller asks. It is selectable at run time because the regression
+       reference set records the preconditioner in its solver line and a build
+       that cannot reproduce the recorded one SKIPS the case: 49 of the 157
+       serial references were unreachable in a SuiteSparse build for that
+       reason alone, all of them through the Schur preconditioner. Forcing the
+       recorded choice is what lets one build run the whole set.
+
+       @a Direct aborts rather than falling back when SuiteSparse is absent,
+       because a silent fallback would reintroduce exactly the mismatch this
+       exists to remove. Parallel is unaffected: the parallel branches use
+       HypreBoomerAMG and offer no choice to make. */
+   enum class PrecType
+   {
+      Default = 0, ///< whatever the build's compile-time macros select
+      Iterative,   ///< force GSSmoother
+      Direct,      ///< force UMFPackSolver; aborts without SuiteSparse
+   };
+
+private:
+   Array<int> offsets;
+   int trace_solve_level{-1};
+   bool npc{false};
+   PrecType prec_type{PrecType::Default};
+   const Array<int> &ess_flux_tdofs_list;
+   DarcyForm *darcy;
+   LinearForm *g{};
+   LinearForm *f{};
+   LinearForm *h{};
+#ifdef MFEM_USE_MPI
+   ParDarcyForm *pdarcy {};
+   ParLinearForm *pg{};
+   ParLinearForm *pf{};
+   ParLinearForm *ph{};
+#endif
+   const std::vector<std::variant<Coefficient*,VectorCoefficient*>> coeffs;
+   SolverType solver_type;
+   bool btime_u, btime_p;
+   real_t rtol{1e-6};
+   real_t atol{1e-10};
+   int max_iters{1000};
+
+   FiniteElementSpace *trace_space{};
+
+   real_t idt{};
+   std::unique_ptr<Coefficient> idtcoeff;
+   std::unique_ptr<BilinearForm> Mt0, Mq0;
+
+   std::string lsolver_str;
+   std::unique_ptr<Solver> prec, lin_prec;
+   std::string prec_str, lin_prec_str;
+   std::unique_ptr<IterativeSolver> solver;
+   std::string solver_str;
+   std::unique_ptr<IterativeSolverMonitor> monitor;
+   int monitor_step{-1};
+
+   mutable BlockVector x, rhs;
+
+   class SchurPreconditioner : public Solver
+   {
+      const DarcyForm *darcy;
+#ifdef MFEM_USE_MPI
+      const ParDarcyForm *pdarcy {};
+#endif
+      const Operator *op {};
+      bool nonlinear;
+      PrecType prec_type;
+
+      const char *prec_str;
+      mutable std::unique_ptr<BlockDiagonalPreconditioner> darcyPrec;
+      mutable std::unique_ptr<SparseMatrix> S;
+#ifdef MFEM_USE_MPI
+      mutable std::unique_ptr<HypreParMatrix> hS;
+#endif
+      mutable bool reconstruct {};
+
+      void Construct(const Vector &x) const;
+#ifdef MFEM_USE_MPI
+      void ConstructPar(const Vector &x) const;
+#endif
+
+   public:
+      SchurPreconditioner(const DarcyForm *darcy, bool nonlinear = false,
+                          PrecType prec_type = PrecType::Default);
+#ifdef MFEM_USE_MPI
+      SchurPreconditioner(const ParDarcyForm *darcy, bool nonlinear = false,
+                          PrecType prec_type = PrecType::Default);
+#endif
+
+      const char *GetString() const { return prec_str; }
+
+      void SetOperator(const Operator &op_) override
+      { op = &op_; reconstruct = true; }
+
+      void Mult(const Vector &x, Vector &y) const override;
+   };
+
+public:
+   class SolutionController : public IterativeSolverController
+   {
+   public:
+      enum class Type
+      {
+         Native,
+         Flux,
+         Potential
+      };
+
+   protected:
+      DarcyForm &darcy;
+      BlockVector &x;
+      const BlockVector &rhs;
+      Type type;
+      real_t rtol;
+      int it_prev{};
+      Vector sol_prev;
+
+      bool CheckSolution(const Vector &x, const Vector &y) const;
+      virtual void ReduceValues(real_t diff[], int num) const { }
+
+   public:
+      SolutionController(DarcyForm &darcy, BlockVector &x, const BlockVector &rhs,
+                         Type type, real_t rtol);
+
+      void MonitorSolution(int it, real_t norm, const Vector &x,
+                           bool final) override;
+
+      bool RequiresUpdatedSolution() const override { return true; }
+   };
+
+#ifdef MFEM_USE_MPI
+   class ParSolutionController : public SolutionController
+   {
+   protected:
+      ParDarcyForm &pdarcy;
+
+      void ReduceValues(real_t diff[], int num) const override;
+
+   public:
+      ParSolutionController(ParDarcyForm &pdarcy, BlockVector &x,
+                            const BlockVector &rhs, Type type, real_t rtol);
+
+      void MonitorSolution(int it, real_t norm, const Vector &x,
+                           bool final) override;
+   };
+#endif //MFEM_USE_MPI
+
+private:
+   SolutionController::Type sol_type{SolutionController::Type::Native};
+
+   class IterativeGLVis : public IterativeSolverMonitor
+   {
+   protected:
+      DarcyForm &darcy;
+      BlockVector &x;
+      const BlockVector *rhs;
+      int step;
+      bool save_files;
+
+      socketstream q_sock, t_sock;
+
+      void Init();
+      virtual void StreamPreamble(socketstream &ss) { }
+      virtual std::string FormFilename(const char *base, int it,
+                                       const char *suff = "gf");
+   public:
+      IterativeGLVis(DarcyForm &darcy, BlockVector &x, const BlockVector &rhs,
+                     int step = 0, bool save_files = false);
+
+      IterativeGLVis(DarcyForm &darcy, BlockVector &x, int step = 0,
+                     bool save_files = false);
+
+      void MonitorSolution(int it, real_t norm, const Vector &x,
+                           bool final) override;
+
+      bool RequiresUpdatedSolution() const override { return true; }
+   };
+
+#ifdef MFEM_USE_MPI
+   class ParIterativeGLVis : public IterativeGLVis
+   {
+      ParDarcyForm &pdarcy;
+
+      void StreamPreamble(socketstream &ss) override;
+      std::string FormFilename(const char *base, int it,
+                               const char *suff = "gf") override;
+   public:
+      ParIterativeGLVis(ParDarcyForm &pdarcy_, BlockVector &x, const BlockVector &rhs,
+                        int step = 0, bool save_files = false)
+         : IterativeGLVis(pdarcy_, x, rhs, step), pdarcy(pdarcy_) { }
+
+      ParIterativeGLVis(ParDarcyForm &pdarcy_, BlockVector &x, int step = 0,
+                        bool save_files = false)
+         : IterativeGLVis(pdarcy_, x, step), pdarcy(pdarcy_) { }
+   };
+#endif //MFEM_USE_MPI
+
+   void SetupNonlinearSolver(real_t rtol, real_t atol, int iters);
+   void SetupLinearSolver(real_t rtol, real_t atol, int iters);
+
+public:
+   /// Constructor
+   /** @param ess_flux_tdofs_list      list of essential TDOFs for the flux
+       @param darcy                    discretization of the mixed system
+       @param rhs                      right hand sides
+       @param coeffs                   array of time-dependent coefficients
+                                       that need to be updated for assembly
+                                       of the right-hand-side linear forms
+       @param stype                    nonlinear solver type
+       @param btime_u                  flag for time evolving flux
+       @param btime_p                  flag for time evolving potential
+    */
+   DarcyOperator(const Array<int> &ess_flux_tdofs_list, DarcyForm *darcy,
+                 std::vector<LinearForm*> rhs,
+                 std::vector<std::variant<Coefficient*,VectorCoefficient*>> coeffs,
+                 SolverType stype = SolverType::LBFGS,  bool btime_u = false,
+                 bool btime_p = false);
+
+#ifdef MFEM_USE_MPI
+   /// Constructor (parallel)
+   /** @param ess_flux_tdofs_list      list of essential TDOFs for the flux
+       @param darcy                    discretization of the mixed system
+       @param rhs                      right hand side
+       @param coeffs                   array of time-dependent coefficients
+                                       that need to be updated for assembly
+                                       of the right-hand-side linear forms
+       @param stype                    nonlinear solver type
+       @param btime_u                  flag for time evolving flux
+       @param btime_p                  flag for time evolving potential
+    */
+   DarcyOperator(const Array<int> &ess_flux_tdofs_list, ParDarcyForm *darcy,
+                 std::vector<ParLinearForm*> rhs,
+                 std::vector<std::variant<Coefficient*,VectorCoefficient*>> coeffs,
+                 SolverType stype = SolverType::LBFGS,  bool btime_u = false,
+                 bool btime_p = false);
+#endif
+
+   /// Destructor
+   ~DarcyOperator();
+
+   /// Set the tolerance of iterative solvers
+   void SetTolerance(real_t rtol_, real_t atol_ = 0.) { rtol = rtol_; atol = atol_; }
+
+   /** @brief Force the serial preconditioner instead of taking the build's
+       compile-time choice. See PrecType.
+
+       Must be called BEFORE the first ImplicitSolve(), which is where the
+       solver stack is built; it is read once, when `reassemble` is true, and
+       a later call changes nothing. */
+   void SetPrecType(PrecType type) { prec_type = type; }
+
+   /// Set the maximal number of iterations of iterative solvers
+   void SetMaxIters(int iters_) { max_iters = iters_; }
+
+   /** @brief How much of the hybridized trace system to build, and what to
+       solve it with. Negative leaves the choice as it was.
+
+       0  assemble the reduced gradient, precondition with a direct solve
+       1  assemble it, precondition with Gauss-Seidel
+       2  do not assemble it -- DarcyHybridization::GradientMode::MatrixFree --
+          and solve with an unpreconditioned Krylov method, there being no
+          matrix for GS or a direct solver to work on
+
+       Only 2 changes the operator; 0 and 1 change what preconditions it. The
+       caller sets the gradient mode itself, on the hybridization; this decides
+       the preconditioner to match.
+
+       **Leaving this alone is expensive, and the default leaves it alone.**
+       ImplicitSolve()'s hybridized-nonlinear branch builds a smoother, names
+       it in the reported solver string, and attaches it ONLY when this method
+       has asked for a level -- see the note at that site. So the default runs
+       an unpreconditioned Krylov solve on the trace system while reporting
+       "Newton+GMRES+GS", and on a problem hard enough to matter it does not
+       converge at all: `hdgperf -n 128 -o 3 -k 0.1`, which is
+       `convdiff -p 6 -o 3 -nx 128 -dg -hb -nl -npc -nls 3`, hits the
+       1000-iteration cap on every one of its Newton steps.
+
+       Measured there, best of two, MKL_NUM_THREADS=1:
+
+         level        wall      inner GMRES          err_t
+         default    49.6 s     capped, 4 steps    2.09e-07
+         1 (GS)     54.6 s     converges          3.86e-08
+         0 (direct) 17.1 s     converges          3.86e-08
+
+       **2.9x, and the answer is better as well as cheaper** -- an inexact
+       Newton step is still a descent direction, so the default converges its
+       OUTER test onto a less accurate solution rather than failing visibly.
+       Levels 0 and 1 agree with each other to six digits, which is the check
+       that says they solve the same problem and the default does not. Level 2
+       is 239.9 s where level 0 is 11.3 s on the same problem at n = 96: with
+       no assembled matrix there is nothing to precondition. The same flag is
+       worth 4.3x on problem 2 (23.1 s -> 5.4 s), so it is not specific to
+       Burgers. */
+   void SetTraceSolveLevel(int level) { trace_solve_level = level; }
+
+   /** @brief Solve by NPC instead of by the reduced trace system.
+
+       The default route hands the outer solver an Operator on the **trace**,
+       solves it, and then rebuilds the flux and potential from the answer with
+       RecoverFEMSolution(). NPC makes all three Newton state and solves the
+       Jacobian by hybridized elimination instead -- one local factorisation
+       and one local linear solve per outer step, no local nonlinear iteration,
+       and a convergence test on the full residual rather than on the trace
+       alone. See DarcyHybridization::NPCResidual().
+
+       Off by default: nothing existing changes. The solver built by
+       SetupNonlinearSolver() is reused as-is -- the outer NewtonSolver becomes
+       Newton on the full system and the trace solver it was given becomes the
+       one inside DarcyNPCSolver -- so -gm and the preconditioner choice mean
+       what they meant before.
+
+       Requires a **discontinuous flux space** and refuses
+       LocalOpType::FluxNL; DarcyHybridization::NPCCheck() states both, and
+       both abort rather than return something wrong. It also requires a
+       hybridized nonlinear problem: with no trace space, or a linear one,
+       this is ignored. */
+   void SetNPC(bool npc_ = true) { npc = npc_; }
+
+   void EnableSolutionController(SolutionController::Type type) { sol_type = type; }
+   void EnableIterationsVisualization(int vis_step = 0) { monitor_step = vis_step; }
+
+   /// Construct state vector offsets
+   /** Constructs state vector offsets corresponding to the DarcyForm @p darcy.
+       Note this includes trace unknonws for hybridized systems. */
+   static Array<int> ConstructOffsets(const DarcyForm &darcy);
+
+   /// Get the state vector offsets
+   /** @see ConstructOffsets() */
+   inline const Array<int>& GetOffsets() const { return offsets; }
+
+   /// Get the associated DarcyForm
+   inline const DarcyForm& GetDarcyForm() const { return *darcy; }
+
+#ifdef MFEM_USE_MPI
+   /// Get the associated ParDarcyForm
+   inline const ParDarcyForm& GetParDarcyForm() const
+   { MFEM_VERIFY(pdarcy, "No ParDarcyForm!"); return *pdarcy; }
+#endif
+
+   void ImplicitSolve(const real_t dt, const Vector &x, Vector &k) override;
+
+   /// Updates the operator after a change of the mesh
+   void Update();
+};
+
+void RandomizeMesh(Mesh &mesh, real_t dr);
+
+} // namespace hdg
+} // namespace mfem
+
+#endif // MFEM_HDG_DARCYOP

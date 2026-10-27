@@ -1,0 +1,1203 @@
+// Copyright (c) 2010-2025, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#include "mfem.hpp"
+#include "unit_tests.hpp"
+
+#ifdef MFEM_USE_OPENMP
+#include <omp.h>
+#endif
+
+using namespace mfem;
+
+namespace darcy_threaded_assembly
+{
+
+// The mixed Darcy problem of test_darcy_hybridization.cpp, which is that of
+// examples/hdg/ex5.cpp. Nothing here tests the discretisation -- what is under
+// test is that DarcyHybridization::AssemblyMode::Threaded builds the identical
+// trace matrix, so the problem only has to be one whose assembly exercises the
+// blocks: A, the Schur complement, and the E, G and H face terms.
+
+real_t pExact(const Vector &x)
+{
+   const real_t z = (x.Size() == 3) ? x(2) : 0.0;
+   return exp(x(0)) * sin(x(1)) * cos(z);
+}
+
+real_t gExact(const Vector &x)
+{
+   return (x.Size() == 3) ? -pExact(x) : 0.0;
+}
+
+real_t pNatural(const Vector &x) { return -pExact(x); }
+
+enum class Form { RT, DG };
+
+/// A copy of the assembled trace matrix, in the only form that can settle the
+/// question: the raw arrays, so the comparison is of stored entries and of the
+/// pattern that holds them, not of an operator's action on some vector.
+struct TraceMatrix
+{
+   int height = 0, width = 0, nnz = 0;
+   Array<int> I, J;
+   Vector A;
+
+   void CopyFrom(const SparseMatrix &H)
+   {
+      height = H.Height();
+      width  = H.Width();
+      nnz    = H.NumNonZeroElems();
+      I.SetSize(height+1);
+      for (int i = 0; i <= height; i++) { I[i] = H.GetI()[i]; }
+      J.SetSize(nnz);
+      A.SetSize(nnz);
+      for (int k = 0; k < nnz; k++) { J[k] = H.GetJ()[k]; A[k] = H.GetData()[k]; }
+   }
+};
+
+/// Assemble the hybridized trace matrix once, in the given assembly mode.
+/// Everything one linear hybridized solve produces that a threaded element
+/// loop could disturb: the trace matrix from ComputeH(), the reduced
+/// right-hand side from EliminateVDofsInRHS() and ReduceRHS(), and the fields
+/// recovered by ComputeSolution().
+struct LinearOutcome
+{
+   TraceMatrix H;
+   Vector rhs, flux, pot;
+   /// The rich reconstruction, filled only when @a reconstruct asks for it.
+   Vector ut, u_s, p_s, tr_s;
+};
+
+/// @a integ_thread_safe makes the caller's promise, which is what licenses
+/// the threaded element loop in DarcyForm::ReconstructFluxAndPot(); it is
+/// inert on every other loop here, all of which are already covered.
+/// @a reconstruct additionally runs that post-processing.
+LinearOutcome Assemble(Mesh &mesh, int order, Form form,
+                       DarcyHybridization::AssemblyMode mode,
+                       bool integ_thread_safe = false,
+                       bool reconstruct = false)
+{
+   const int dim = mesh.Dimension();
+
+   std::unique_ptr<FiniteElementCollection> u_coll;
+   if (form == Form::DG)
+   {
+      u_coll.reset(new L2_FECollection(order, dim, BasisType::GaussLobatto));
+   }
+   else
+   {
+      u_coll.reset(new RT_FECollection(order, dim));
+   }
+   L2_FECollection p_coll(order, dim);
+   FiniteElementSpace fes_u(&mesh, u_coll.get(), (form == Form::DG) ? dim : 1);
+   FiniteElementSpace fes_p(&mesh, &p_coll);
+
+   ConstantCoefficient k(1.0);
+   VectorFunctionCoefficient fcoeff(dim, [](const Vector &, Vector &f)
+   {
+      f = 0.0;
+   });
+   FunctionCoefficient gcoeff(gExact);
+   FunctionCoefficient natcoeff(pNatural);
+   RatioCoefficient ik(1.0, k);
+
+   DarcyForm darcy(&fes_u, &fes_p);
+   LinearForm *fform = darcy.GetFluxRHS();
+
+   if (form == Form::DG)
+   {
+      darcy.GetFluxMassForm()->AddDomainIntegrator(new VectorMassIntegrator(k));
+      MixedBilinearForm *B = darcy.GetFluxDivForm();
+      B->AddDomainIntegrator(new VectorDivergenceIntegrator());
+      B->AddInteriorFaceIntegrator(
+         new TransposeIntegrator(new DGNormalTraceIntegrator(-1.)));
+      // The stabilisation is what puts the E and G face blocks into the Schur
+      // complement, so the DG case covers strictly more of ComputeH() than RT.
+      darcy.GetPotentialMassForm()->AddInteriorFaceIntegrator(
+         new HDGDiffusionIntegrator(ik, 0.5));
+
+      fform->AddDomainIntegrator(new VectorDomainLFIntegrator(fcoeff));
+      fform->AddBdrFaceIntegrator(new VectorBoundaryFluxLFIntegrator(natcoeff));
+   }
+   else
+   {
+      darcy.GetFluxMassForm()->AddDomainIntegrator(new VectorFEMassIntegrator(k));
+      darcy.GetFluxDivForm()->AddDomainIntegrator(
+         new VectorFEDivergenceIntegrator);
+
+      fform->AddDomainIntegrator(new VectorFEDomainLFIntegrator(fcoeff));
+      fform->AddBoundaryIntegrator(
+         new VectorFEBoundaryFluxLFIntegrator(natcoeff));
+   }
+   darcy.GetPotentialRHS()->AddDomainIntegrator(new DomainLFIntegrator(gcoeff));
+
+   Array<int> ess_flux_tdofs;
+   DG_Interface_FECollection trace_coll(order, dim);
+   FiniteElementSpace fes_t(&mesh, &trace_coll);
+
+   darcy.EnableHybridization(&fes_t, new NormalTraceJumpIntegrator(),
+                             ess_flux_tdofs);
+   if (integ_thread_safe)
+   {
+      darcy.GetHybridization()->SetIntegratorsThreadSafe();
+   }
+   darcy.GetHybridization()->SetAssemblyMode(mode);
+   darcy.Assemble();
+
+   BlockVector x(darcy.GetOffsets());
+   x = 0.0;
+
+   OperatorPtr A;
+   Vector X, B;
+   darcy.FormLinearSystem(ess_flux_tdofs, x, A, X, B, true);
+
+   SparseMatrix *H = A.As<SparseMatrix>();
+   MFEM_VERIFY(H, "the hybridized system is not an assembled SparseMatrix");
+
+   LinearOutcome out;
+   out.H.CopyFrom(*H);
+   out.rhs = B;
+
+   // Solving and recovering is what brings ComputeSolution() into the
+   // comparison. The solve itself is serial and identical either way, so any
+   // difference in the fields is the recovery's.
+   UMFPackSolver lin(*H);
+   lin.Mult(B, X);
+   darcy.RecoverFEMSolution(X, x, x);
+   out.flux = x.GetBlock(0);
+   out.pot = x.GetBlock(1);
+
+   if (reconstruct)
+   {
+      GridFunction ut, u_s, p_s, tr_s;
+      darcy.Reconstruct(x, X, ut, u_s, p_s, tr_s);
+      out.ut = ut;
+      out.u_s = u_s;
+      out.p_s = p_s;
+      out.tr_s = tr_s;
+   }
+   return out;
+}
+
+/** The comparison the acceptance criterion asks for, and it is equality
+    rather than a tolerance on purpose.
+
+    The plan this came from warned that "bitwise agreement is the wrong
+    criterion and asking for it will send someone chasing a non-existent bug",
+    on the grounds that threading a reduction reassociates it. That is true of
+    a threaded scatter and false here, because the element-local work is
+    per-element and reassociates nothing: every entry of the trace matrix is a
+    sum of at most two terms, one per element sharing the face the trace dof
+    lives on, and IEEE addition of two terms is order-independent. Equality is
+    therefore the right test and a difference of any size is a defect.
+
+    This is a *differential* test: it compares the two modes, which share the
+    scatter, so it cannot catch a change that moves both. What guards that is
+    the rest of the suite together with the miniapp regressions. What it does
+    catch is the hazard the plan named -- reinstating one `static` on the
+    element-local scratch, so two threads share it, fails this at four threads
+    on the smallest case here, with 143 stored entries against 144. */
+void RequireIdentical(const TraceMatrix &ref, const TraceMatrix &got)
+{
+   REQUIRE(got.height == ref.height);
+   REQUIRE(got.width == ref.width);
+   // The pattern first: AddSubMatrix()'s skip_zeros drops entries by value, so
+   // a scatter that had lost the &rows != &cols distinction would show up here
+   // as a different nnz long before any entry differed.
+   REQUIRE(got.nnz == ref.nnz);
+   for (int i = 0; i <= ref.height; i++) { REQUIRE(got.I[i] == ref.I[i]); }
+   for (int k = 0; k < ref.nnz; k++) { REQUIRE(got.J[k] == ref.J[k]); }
+
+   real_t max_diff = 0.0;
+   for (int k = 0; k < ref.nnz; k++)
+   {
+      max_diff = std::max(max_diff, std::abs(got.A[k] - ref.A[k]));
+   }
+   REQUIRE(max_diff == 0.0);
+}
+
+/// A semilinear potential mass. This is what puts MultNL on its nonlinear
+/// path, which is the loop the second test case below is about -- the first
+/// exercises ComputeH's loop, and the two are threaded separately.
+class CubeSource : public NonlinearFormIntegrator
+{
+public:
+   explicit CubeSource(real_t c_) : c(c_) { }
+
+   void AssembleElementVector(const FiniteElement &el,
+                              ElementTransformation &Tr,
+                              const Vector &elfun, Vector &elvect) override
+   {
+      const int dof = el.GetDof();
+      Vector shape(dof);
+      elvect.SetSize(dof);
+      elvect = 0.0;
+      const IntegrationRule &ir = IntRules.Get(el.GetGeomType(),
+                                               2*el.GetOrder() + 3);
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         Tr.SetIntPoint(&ip);
+         el.CalcShape(ip, shape);
+         const real_t u = shape * elfun;
+         elvect.Add(ip.weight * Tr.Weight() * c * u * u * u, shape);
+      }
+   }
+
+   void AssembleElementGrad(const FiniteElement &el, ElementTransformation &Tr,
+                            const Vector &elfun, DenseMatrix &elmat) override
+   {
+      const int dof = el.GetDof();
+      Vector shape(dof);
+      elmat.SetSize(dof);
+      elmat = 0.0;
+      const IntegrationRule &ir = IntRules.Get(el.GetGeomType(),
+                                               2*el.GetOrder() + 3);
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         Tr.SetIntPoint(&ip);
+         el.CalcShape(ip, shape);
+         const real_t u = shape * elfun;
+         AddMult_a_VVt(ip.weight * Tr.Weight() * c * 3.0 * u * u, shape, elmat);
+      }
+   }
+
+private:
+   real_t c;
+};
+
+/** @brief An inverse conductivity that depends on the potential,
+    @f$a(p) = 1 + p^2/2@f$, so the flux row's derivative in the potential --
+    the (0,1) block of the element gradient -- is nonzero.
+
+    That block is collected into DarcyHybridization's Bnl_data, which is
+    allocated by the first element to write one; see the case that threads
+    it. Reentrant: every method is const and uses locals only. */
+class PotentialDependentFlux : public MixedFluxFunction
+{
+   const bool depends;
+
+public:
+   /// @a depends_ false gives a(p) = 1, the same law without the (0,1) block.
+   PotentialDependentFlux(int dim_, bool depends_ = true)
+      : MixedFluxFunction(1, dim_), depends(depends_) { }
+
+   real_t ComputeDualFlux(const Vector &u, const DenseMatrix &flux,
+                          ElementTransformation &, DenseMatrix &df) const override
+   {
+      const real_t a = 1.0 + (depends ? 0.5 * u(0) * u(0) : 0.0);
+      df.SetSize(1, dim);
+      for (int d = 0; d < dim; d++) { df(0, d) = a * flux(0, d); }
+      return a;
+   }
+
+   real_t ComputeFlux(const Vector &, ElementTransformation &,
+                      DenseMatrix &flux) const override
+   {
+      flux = 0.0;
+      return 0.0;
+   }
+
+   void ComputeDualFluxJacobian(const Vector &u, const DenseMatrix &flux,
+                                ElementTransformation &,
+                                DenseMatrix &J_u, DenseMatrix &J_F) const override
+   {
+      const real_t a = 1.0 + (depends ? 0.5 * u(0) * u(0) : 0.0);
+      J_F.SetSize(dim, dim);
+      J_F = 0.0;
+      J_u.SetSize(dim, 1);
+      for (int d = 0; d < dim; d++)
+      {
+         J_F(d, d) = a;
+         J_u(d, 0) = depends ? u(0) * flux(0, d) : 0.0;
+      }
+   }
+};
+
+/// What one evaluation of the reduced nonlinear operator produces: the
+/// residual, the gradient there, and the local nonlinear work it took.
+struct NLOutcome
+{
+   Vector residual;
+   TraceMatrix grad;
+   long local_nl_iters = 0;
+};
+
+/// @a integ_thread_safe is a parameter and not a constant so that the case
+/// which checks the REFUSAL can build the identical problem without the
+/// promise; see "A threaded element loop that evaluates an integrator is
+/// refused".
+///
+/// With @a law the flux mass is that law on the block nonlinear form instead
+/// of the linear VectorMassIntegrator.
+NLOutcome EvaluateNL(Mesh &mesh, int order,
+                     DarcyHybridization::AssemblyMode mode,
+                     bool integ_thread_safe = true,
+                     const MixedFluxFunction *law = nullptr)
+{
+   const int dim = mesh.Dimension();
+   L2_FECollection u_coll(order, dim, BasisType::GaussLobatto);
+   L2_FECollection p_coll(order, dim);
+   DG_Interface_FECollection t_coll(order, dim);
+   FiniteElementSpace Vh(&mesh, &u_coll, dim), Wh(&mesh, &p_coll),
+                      Mh(&mesh, &t_coll);
+
+   ConstantCoefficient one(1.0);
+   DarcyForm darcy(&Vh, &Wh);
+   if (law)
+   {
+      darcy.GetBlockNonlinearForm()->AddDomainIntegrator(
+         new MixedConductionNLFIntegrator(*law));
+   }
+   else
+   {
+      darcy.GetFluxMassForm()->AddDomainIntegrator(
+         new VectorMassIntegrator(one));
+   }
+
+   Array<int> all(mesh.bdr_attributes.Max());
+   all = 1;
+
+   NonlinearForm *Mnl_p = darcy.GetPotentialMassNonlinearForm();
+   Mnl_p->AddDomainIntegrator(new CubeSource(1.0));
+   Mnl_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0));
+   Mnl_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0), all);
+
+   MixedBilinearForm *B = darcy.GetFluxDivForm();
+   B->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   B->AddInteriorFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-1.0)));
+   B->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-2.0)), all);
+
+   Array<int> ess_flux;
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+   DarcyHybridization &dh = *darcy.GetHybridization();
+   dh.SetEssentialBC(all);
+   // Tight, so the local solve is not itself a source of disagreement.
+   dh.SetLocalNLSolver(DarcyHybridization::LSsolveType::Newton, 100, 1e-12,
+                       1e-16, -1);
+   // **CubeSource is reentrant, and that is checkable rather than hoped for:
+   // its only member is the read-only `c` and its `shape` is a local, so two
+   // threads inside AssembleElementVector() share nothing.** The HDG face
+   // integrators on Mnl_p are BilinearFormIntegrators and land on the linear
+   // c_bfi_p route, which the element loop never evaluates. So the promise
+   // below is true of this fixture, and without it AssemblyMode::Threaded is
+   // refused -- see the case that checks exactly that.
+   dh.SetIntegratorsThreadSafe(integ_thread_safe);
+   dh.SetAssemblyMode(mode);
+   darcy.Assemble();
+
+   Array<int> offs(4);
+   offs[0] = 0;
+   offs[1] = Vh.GetVSize();
+   offs[2] = Wh.GetVSize();
+   offs[3] = Mh.GetVSize();
+   offs.PartialSum();
+   BlockVector sol(offs), rhs(offs);
+   sol = 0.0;
+   rhs = 0.0;
+
+   Vector X, RHS;
+   OperatorPtr R;
+   X.MakeRef(sol, offs[2], Mh.GetVSize());
+   RHS.MakeRef(rhs, offs[2], Mh.GetVSize());
+   BlockVector dsol(sol, darcy.GetOffsets()), drhs(rhs, darcy.GetOffsets());
+   darcy.FormLinearSystem(ess_flux, dsol, drhs, R, X, RHS, true);
+
+   // A trace that is not the solution and not zero, so the residual and the
+   // gradient are both somewhere interesting. Deterministic, so the two runs
+   // are asked the same question.
+   Vector x(Mh.GetVSize());
+   for (int i = 0; i < x.Size(); i++)
+   { x(i) = 0.25 * std::sin(1.0 + 3.0 * i); }
+
+   NLOutcome out;
+   const long nl0 = dh.GetNumLocalNLIterations();
+   out.residual.SetSize(x.Size());
+   R->Mult(x, out.residual);
+   Operator &grad = R->GetGradient(x);
+   out.grad.CopyFrom(*dynamic_cast<SparseMatrix*>(&grad));
+   out.local_nl_iters = dh.GetNumLocalNLIterations() - nl0;
+   return out;
+}
+
+
+/// Bitwise equality of two vectors, with which one it was in the failure.
+void RequireSameVector(const Vector &ref, const Vector &got, const char *what)
+{
+   CAPTURE(what);
+   REQUIRE(got.Size() == ref.Size());
+   real_t max_diff = 0.0;
+   for (int i = 0; i < ref.Size(); i++)
+   {
+      max_diff = std::max(max_diff, std::abs(got(i) - ref(i)));
+   }
+   REQUIRE(max_diff == 0.0);
+}
+
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE)
+
+// Declared weak rather than reached through <mkl.h>: MKL's headers are not
+// among MFEM's dependencies, BLAS is only sometimes MKL, and a weak symbol
+// that stays null is exactly the "not MKL" case. GNU and clang only; on any
+// other compiler the guard below is a documented no-op.
+#if defined(__GNUC__)
+extern "C" void MKL_Set_Num_Threads(int) __attribute__((weak));
+extern "C" int MKL_Get_Max_Threads(void) __attribute__((weak));
+#define MFEM_TEST_HAVE_WEAK_MKL 1
+#endif
+
+/** @brief Pins MKL to one thread while it is alive, and restores the previous
+    count on the way out. Does nothing at all where BLAS is not MKL.
+
+    WHY THE TWO CASES BELOW CANNOT ASSERT BITWISE EQUALITY WITHOUT IT. They
+    compare a serial assembly against a threaded one and select the thread
+    count with omp_set_num_threads(). DenseMatrix reaches BLAS whenever
+    MFEM_USE_LAPACK is on, and an MKL built against libgomp -- which is what
+    this tree now LINKS (-lmkl_gnu_thread, see config/user.mk) and what meq's
+    CMake build resolves to as well -- takes its own thread count from that
+    SAME OpenMP runtime. So changing MFEM's thread count silently changes MKL's GEMM
+    blocking too, and the two runs differ in the BLAS's own reduction order
+    however correct the colouring is. Neither run is wrong; they are not the
+    same arithmetic.
+
+    Measured on the recovered flux at order 2, before this existed:
+    **4.44e-14 on the DG form and 34.875 on RT**, with nt = 1 passing and
+    nt = 2 failing, identical over repeated runs -- deterministic, so not a
+    race. MKL_NUM_THREADS=1 makes every case pass; MKL_CBWR=COMPATIBLE does
+    NOT, which is what says the cause is reduction ORDER and not the
+    instruction-set dispatch CBWR controls.
+
+    The two magnitudes are one cause with two amplifications, and the RT one
+    is NOT explained -- a 1e-16 perturbation of that local system emerging as
+    O(10) is either its conditioning or a pivot order selecting a different
+    member of a singular system's solution family. Recorded because a future
+    reader who removes this guard will see 34.875 and reach for a race.
+
+    This went unnoticed for as long as it did because these cases had never
+    RUN anywhere: both HDG development trees build with MFEM_THREAD_SAFE off,
+    where AssemblyMode::Threaded aborts and the cases WARN instead. The first
+    build to execute them was one configured elsewhere. */
+class MKLPinnedToOneThread
+{
+#ifdef MFEM_TEST_HAVE_WEAK_MKL
+   const int saved;
+public:
+   MKLPinnedToOneThread()
+      : saved(MKL_Get_Max_Threads ? MKL_Get_Max_Threads() : 0)
+   {
+      if (MKL_Set_Num_Threads) { MKL_Set_Num_Threads(1); }
+   }
+   ~MKLPinnedToOneThread()
+   {
+      if (MKL_Set_Num_Threads && saved > 0) { MKL_Set_Num_Threads(saved); }
+   }
+#else
+public:
+   // User-provided, so the object is not trivially destructible and an
+   // unnamed-purpose local of this type draws no -Wunused-variable.
+   MKLPinnedToOneThread() { }
+   ~MKLPinnedToOneThread() { }
+#endif
+};
+
+#endif // MFEM_USE_OPENMP && MFEM_THREAD_SAFE
+
+} // namespace darcy_threaded_assembly
+
+using namespace darcy_threaded_assembly;
+
+TEST_CASE("Threaded trace assembly is bit-for-bit the serial one",
+          "[DarcyHybridization][AssemblyMode]")
+{
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE)
+   // Before anything below reaches BLAS: see MKLPinnedToOneThread. The
+   // bitwise assertions are about MFEM's accumulation order and cannot
+   // survive MKL re-blocking itself when the thread count moves.
+   const MKLPinnedToOneThread mkl_pinned;
+   const int saved_threads = omp_get_max_threads();
+
+   for (Form form : {Form::RT, Form::DG})
+   {
+      for (int order : {0, 1, 2})
+      {
+         // Two dimensions and two element types, because the chunking walks
+         // elements in blocks and a ragged block size is what would break it.
+         Mesh quad = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+         Mesh hex  = Mesh::MakeCartesian3D(2, 2, 2, Element::HEXAHEDRON);
+
+         for (Mesh *mesh : {&quad, &hex})
+         {
+            CAPTURE(int(form), order, mesh->Dimension());
+
+            omp_set_num_threads(1);
+            const LinearOutcome ref = Assemble(
+                                         *mesh, order, form,
+                                         DarcyHybridization::AssemblyMode::Serial);
+
+            // A thread count of one must also agree, which separates "the
+            // refactor changed something" from "the threading changed
+            // something": only the second can depend on the count.
+            for (int nt : {1, 2, 4, 8})
+            {
+               CAPTURE(nt);
+               omp_set_num_threads(nt);
+               const LinearOutcome got = Assemble(
+                                            *mesh, order, form,
+                                            DarcyHybridization::AssemblyMode::Threaded);
+               RequireIdentical(ref.H, got.H);
+
+               // Section 3's loops: the reduced right-hand side is
+               // EliminateVDofsInRHS() and ReduceRHS(), the fields are
+               // ComputeSolution(). Bitwise for the same two-term reason as
+               // the matrix -- and for the field loops, because with
+               // discontinuous spaces each element's dofs are its own, so
+               // there is only ONE term.
+               RequireSameVector(ref.rhs, got.rhs, "reduced rhs");
+               RequireSameVector(ref.flux, got.flux, "recovered flux");
+               RequireSameVector(ref.pot, got.pot, "recovered potential");
+            }
+         }
+      }
+   }
+
+   omp_set_num_threads(saved_threads);
+#else
+   WARN("Threaded assembly needs MFEM_USE_OPENMP and MFEM_THREAD_SAFE; "
+        "this build has neither or only one, so nothing was checked.");
+#endif
+}
+
+TEST_CASE("A threaded nonlinear element loop is bit-for-bit the serial one",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // The case above threads ComputeH. This one threads MultNL, which is the
+   // loop that matters for a stiff problem and the one that reaches
+   // integrators and the Mesh transformation cache -- so it is the loop that
+   // needed the integrators made thread-safe and the caller-allocated
+   // transformations, not just a colouring.
+   //
+   // BITWISE IS THE RIGHT ASSERTION HERE, and that is a claim about the
+   // arithmetic rather than an optimistic default. The colouring changes the
+   // ORDER in which the two elements of a face accumulate into a trace dof,
+   // and floating-point addition is not associative -- but each trace dof of a
+   // DG_Interface space receives exactly one contribution per adjacent
+   // element, so at most two, and a + b == b + a exactly. The same argument
+   // covers H_f in AssembleHDGGrad(). It would NOT cover an H1_Trace space,
+   // where a dof is shared between faces and so sees more than two.
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE)
+   // Before anything below reaches BLAS: see MKLPinnedToOneThread. The
+   // bitwise assertions are about MFEM's accumulation order and cannot
+   // survive MKL re-blocking itself when the thread count moves.
+   const MKLPinnedToOneThread mkl_pinned;
+   const int saved_threads = omp_get_max_threads();
+
+   for (int order : {0, 1, 2})
+   {
+      Mesh quad = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+      Mesh tri  = Mesh::MakeCartesian2D(4, 4, Element::TRIANGLE);
+
+      for (Mesh *mesh : {&quad, &tri})
+      {
+         CAPTURE(order, mesh->GetNE());
+
+         omp_set_num_threads(1);
+         const NLOutcome ref =
+            EvaluateNL(*mesh, order, DarcyHybridization::AssemblyMode::Serial);
+
+         for (int nt : {1, 2, 4, 8})
+         {
+            CAPTURE(nt);
+            omp_set_num_threads(nt);
+            const NLOutcome got = EvaluateNL(
+                                     *mesh, order,
+                                     DarcyHybridization::AssemblyMode::Threaded);
+
+            REQUIRE(got.residual.Size() == ref.residual.Size());
+            real_t max_diff = 0.0;
+            for (int i = 0; i < ref.residual.Size(); i++)
+            {
+               max_diff = std::max(max_diff,
+                                   std::abs(got.residual(i) - ref.residual(i)));
+            }
+            REQUIRE(max_diff == 0.0);
+
+            RequireIdentical(ref.grad, got.grad);
+
+            // The local nonlinear iteration count is what the atomic in
+            // MultInvNL() protects, and a plain += loses updates under
+            // threading. It is also what the NPC regression references
+            // compare, so a lost count is not cosmetic.
+            REQUIRE(got.local_nl_iters == ref.local_nl_iters);
+         }
+      }
+   }
+
+   omp_set_num_threads(saved_threads);
+#else
+   WARN("Threaded nonlinear assembly needs MFEM_USE_OPENMP and "
+        "MFEM_THREAD_SAFE; this build has neither or only one, so nothing "
+        "was checked. No CI configuration in this repository sets both -- "
+        "make hpc enables OpenMP without thread safety, and only the "
+        "deprecated MFEM_USE_LEGACY_OPENMP forces it -- so this case is "
+        "inert unless someone configures for it deliberately.");
+#endif
+}
+
+TEST_CASE("A gradient block first written inside the threaded loop is "
+          "allocated outside it",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // gffp's report, 2026-09-30. ConstructGrad() allocated Bnl_data -- the
+   // (0,1) block of the element gradient, written only by a flux law that
+   // depends on the potential -- on the FIRST element to write one, inside
+   // MultNL()'s threaded element loop. The reallocation freed the buffer that
+   // other threads were writing their blocks through, and two threads could
+   // each see it unallocated and each allocate it. In gffp's run that was 14
+   // glibc arena assertions and a stack smash at eight threads; here it is
+   // whatever the heap does, so the assertion is the one the case above
+   // makes: the threaded loop gives the serial residual and gradient bit for
+   // bit. Each EvaluateNL() builds a fresh DarcyHybridization, so every
+   // threaded arm is a first call and reaches the allocation.
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE)
+   using AM = DarcyHybridization::AssemblyMode;
+   const MKLPinnedToOneThread mkl_pinned;
+   const int saved_threads = omp_get_max_threads();
+
+   for (int order : {1, 2})
+   {
+      Mesh tri = Mesh::MakeCartesian2D(8, 8, Element::TRIANGLE);
+      CAPTURE(order);
+      const PotentialDependentFlux law(2), flat(2, false);
+
+      omp_set_num_threads(1);
+      const NLOutcome ref = EvaluateNL(tri, order, AM::Serial, true, &law);
+
+      // The block has to reach the gradient, or the arms below compare two
+      // gradients that never read it.
+      const NLOutcome ref_flat = EvaluateNL(tri, order, AM::Serial, true,
+                                            &flat);
+      // A different pattern says so already.
+      bool block_reached = (ref_flat.grad.nnz != ref.grad.nnz);
+      for (int k = 0; !block_reached && k < ref.grad.nnz; k++)
+      {
+         block_reached = std::abs(ref.grad.A[k] - ref_flat.grad.A[k]) > 1e-3;
+      }
+      REQUIRE(block_reached);
+
+      // Repeated, because the window is the first element of each thread
+      // and one evaluation opens it only once per pass. Before the fix this
+      // size failed one run in three at a single repetition.
+      for (int nt : {2, 4, 8})
+         for (int rep = 0; rep < 4; rep++)
+         {
+            CAPTURE(nt, rep);
+            omp_set_num_threads(nt);
+            const NLOutcome got = EvaluateNL(tri, order, AM::Threaded, true,
+                                             &law);
+            RequireSameVector(ref.residual, got.residual, "residual");
+            RequireIdentical(ref.grad, got.grad);
+         }
+   }
+
+   omp_set_num_threads(saved_threads);
+#else
+   WARN("Needs MFEM_USE_OPENMP and MFEM_THREAD_SAFE; nothing was checked.");
+#endif
+}
+
+TEST_CASE("The threaded refusal asks which integrators the loop evaluates",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // The predicate behind the refusal, pinned where it can actually run --
+   // the abort itself needs MFEM_USE_EXCEPTIONS to be catchable and no tree
+   // here sets it, so what is asserted is the DECISION rather than the
+   // MFEM_VERIFY downstream of it.
+   //
+   // WHY THIS IS NOT A FORMALITY. It replaced `!CopyLinearGradBlocks()`,
+   // which was wrong in both directions. Over-refusing aborted "A threaded
+   // nonlinear element loop is bit-for-bit the serial one" above, whose
+   // CubeSource is reentrant and whose fixture was safe -- that routine
+   // declines for LocalOpType::PotNL whatever the integrators are, and meq
+   // reported the same against their own solver before it was noticed here.
+   // Under-refusing was worse and quieter: it asked only on GRADIENT passes,
+   // so every residual pass threaded whatever it liked, and this repository's
+   // own hdgperf was measured at eight threads while evaluating a
+   // VectorMassIntegrator -- one of the three MFEM classes whose scratch is
+   // NOT under #ifndef MFEM_THREAD_SAFE -- once per element.
+   //
+   // THE THIRD ROW IS THE ONE THAT SURPRISED. A face integrator added to the
+   // potential mass NONLINEAR form is usually folded onto the linear c_bfi_p
+   // route, where the element loop never evaluates it. Whether it is depends
+   // on FaceIntegratorsAreLinear(), which also asks whether there is
+   // nonlinearity ELSEWHERE -- so with no nonlinear domain term the same
+   // integrator stays on c_nlfi_p and IS evaluated per face. Measured, not
+   // assumed: the arms below were read out of the live handles.
+   struct Arm { const char *what; bool domain_nl; bool face; bool expect; };
+   const Arm arm = GENERATE(
+                      Arm{"nothing nonlinear",          false, false, false},
+                      Arm{"a nonlinear domain source",  true,  false, true},
+                      Arm{"face integrators only",      false, true,  true});
+   CAPTURE(arm.what, arm.domain_nl, arm.face);
+
+   Mesh mesh = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+   L2_FECollection ucoll(1, 2, BasisType::GaussLobatto), pcoll(1, 2);
+   DG_Interface_FECollection tcoll(1, 2);
+   FiniteElementSpace Vh(&mesh, &ucoll, 2), Wh(&mesh, &pcoll), Mh(&mesh, &tcoll);
+   ConstantCoefficient one(1.0);
+   DarcyForm darcy(&Vh, &Wh);
+
+   // On the BILINEAR form, so it is linear and the element loop never
+   // evaluates it however much scratch it holds. That it is a
+   // VectorMassIntegrator is deliberate: the same class on the NONLINEAR
+   // flux mass is what hdgperf was threading.
+   darcy.GetFluxMassForm()->AddDomainIntegrator(new VectorMassIntegrator(one));
+
+   Array<int> all(mesh.bdr_attributes.Max());
+   all = 1;
+   // GetPotentialMassNonlinearForm() CONSTRUCTS the form, so the first arm
+   // must not ask for it at all -- see the accessor's own note.
+   if (arm.domain_nl || arm.face)
+   {
+      NonlinearForm *Mnl_p = darcy.GetPotentialMassNonlinearForm();
+      if (arm.domain_nl) { Mnl_p->AddDomainIntegrator(new CubeSource(1.0)); }
+      if (arm.face)
+      {
+         Mnl_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0));
+         Mnl_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0), all);
+      }
+   }
+
+   MixedBilinearForm *B = darcy.GetFluxDivForm();
+   B->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   B->AddInteriorFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-1.0)));
+   B->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-2.0)), all);
+
+   Array<int> ess_flux;
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+   DarcyHybridization &dh = *darcy.GetHybridization();
+
+   REQUIRE(dh.ElementLoopEvaluatesIntegrators() == arm.expect);
+
+   // And the promise does not change what the loop DOES, only whether it is
+   // allowed to run threaded. Asserting that keeps the two from being
+   // conflated, which is exactly how the old predicate went wrong.
+   dh.SetIntegratorsThreadSafe(true);
+   REQUIRE(dh.ElementLoopEvaluatesIntegrators() == arm.expect);
+}
+
+TEST_CASE("Integrators are not assumed thread-safe",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // The default is the safe one, and it is the default that decides what
+   // happens to a caller who never read SetIntegratorsThreadSafe(). Runs in
+   // every build, unlike the two cases above, because it turns nothing on.
+   Mesh mesh = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL);
+   L2_FECollection ucoll(1, 2), pcoll(1, 2);
+   DG_Interface_FECollection tcoll(1, 2);
+   FiniteElementSpace Vh(&mesh, &ucoll, 2), Wh(&mesh, &pcoll), Mh(&mesh, &tcoll);
+   DarcyForm darcy(&Vh, &Wh);
+   Array<int> ess;
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess);
+   DarcyHybridization &dh = *darcy.GetHybridization();
+
+   REQUIRE_FALSE(dh.GetIntegratorsThreadSafe());
+   dh.SetIntegratorsThreadSafe();
+   REQUIRE(dh.GetIntegratorsThreadSafe());
+   dh.SetIntegratorsThreadSafe(false);
+   REQUIRE_FALSE(dh.GetIntegratorsThreadSafe());
+}
+
+TEST_CASE("Serial assembly mode is the default",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // The acceptance criterion "a serial build unchanged" rests on this: every
+   // existing caller gets the loop it always had without saying anything.
+   Mesh mesh = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL);
+   L2_FECollection u_coll(0, 2, BasisType::GaussLobatto);
+   L2_FECollection p_coll(0, 2);
+   FiniteElementSpace fes_u(&mesh, &u_coll, 2);
+   FiniteElementSpace fes_p(&mesh, &p_coll);
+   DarcyForm darcy(&fes_u, &fes_p);
+
+   Array<int> ess;
+   DG_Interface_FECollection trace_coll(0, 2);
+   FiniteElementSpace fes_t(&mesh, &trace_coll);
+   darcy.EnableHybridization(&fes_t, new NormalTraceJumpIntegrator(), ess);
+
+   REQUIRE(darcy.GetHybridization()->GetAssemblyMode() ==
+           DarcyHybridization::AssemblyMode::Serial);
+}
+
+TEST_CASE("The threaded rich reconstruction is bit-for-bit the serial one",
+          "[DarcyHybridization][AssemblyMode][Reconstruction]")
+{
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE)
+   // See MKLPinnedToOneThread: a bitwise assertion across thread counts
+   // cannot survive MKL re-blocking its own GEMMs, and the local problems
+   // here are dense.
+   const MKLPinnedToOneThread mkl_pinned;
+   const int saved_threads = omp_get_max_threads();
+
+   // WHAT THIS CASE IS ACTUALLY GUARDING, because it is not the obvious
+   // thing. DarcyForm::ReconstructFluxAndPot() solves one local problem per
+   // element whose TRACE is free on every face, so the two elements either
+   // side of an interior face each produce a value for that face's enriched
+   // trace dofs -- and the scatter ASSIGNS. The serial answer is therefore
+   // "whichever element visited the face last", and it is a real dependence:
+   // reversing the element order leaves the enriched flux and potential
+   // identical to 17 digits and moves the enriched trace's norm by about 2%.
+   //
+   // So no colouring can reproduce the serial answer, and the routine
+   // computes in parallel and then REPLAYS the writes serially in element
+   // order. That replay is what this case exists to hold in place, and the
+   // check was falsified rather than argued: run the scatter inside the
+   // parallel region and this case fails on "enriched trace" and on nothing
+   // else -- 7.68e-02 at two threads on the first configuration below, with
+   // ut, u_s and p_s all still bit-identical.
+   //
+   // The RT arm is here because its enriched FLUX space is CONFORMING, so
+   // u_s is face-shared too and the same "last writer wins" formally reaches
+   // it. **It does not, to any size that matters, and that is a measurement
+   // rather than a prediction**: with the scatter raced, RT moves tr_s by
+   // 1.0e+00 to 8.5e+07 and u_s by 1.8e-15 to 6.0e-08 -- round-off against a
+   // trace of that magnitude. The two elements disagree about the trace and
+   // agree about the flux, whose normal component both pin to the same total
+   // flux on the face. The arm earns its place anyway: that RT configuration
+   // carries no potential face constraint, so its local problem is far worse
+   // conditioned than the DG one and its trace is correspondingly enormous,
+   // which makes the equality it still has to satisfy the sharper one.
+   for (Form form : {Form::DG, Form::RT})
+   {
+      for (int order : {0, 1})
+      {
+         Mesh quad = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+         Mesh hex  = Mesh::MakeCartesian3D(2, 2, 2, Element::HEXAHEDRON);
+
+         for (Mesh *mesh : {&quad, &hex})
+         {
+            CAPTURE(int(form), order, mesh->Dimension());
+
+            omp_set_num_threads(1);
+            const LinearOutcome ref =
+               Assemble(*mesh, order, form,
+                        DarcyHybridization::AssemblyMode::Serial, false, true);
+
+            for (int nt : {1, 2, 4, 8})
+            {
+               CAPTURE(nt);
+               omp_set_num_threads(nt);
+               const LinearOutcome got =
+                  Assemble(*mesh, order, form,
+                           DarcyHybridization::AssemblyMode::Threaded, true,
+                           true);
+
+               // The total flux first, and this line changed meaning:
+               // DarcyHybridization::ReconstructTotalFlux() used to be
+               // SERIAL, so a difference here would have said the comparison
+               // was measuring something else entirely. It is threaded now,
+               // in two passes -- faces then element interiors -- so this is
+               // the pin for it and not a control any more.
+               //
+               // **Neither of its passes needs a colouring**, unlike the
+               // three below: a face's dofs of @a ut belong to no other face
+               // and an element's INTERIOR dofs to no other element, so the
+               // destinations are disjoint and the answer cannot depend on
+               // who writes last. What the routine buffers is the WRITE
+               // PATH, not the order -- SetSubVector() is a Write() on the
+               // whole GridFunction.
+               //
+               // **Falsified, both passes separately**, because a race that
+               // does not fire is not a passing test. Sharing the FACE
+               // pass's FaceElementTransformations across threads fails
+               // here at two threads by 2.15 (order 0, 2-D, RT) and nowhere
+               // else; sharing the ELEMENT pass's IsoparametricTransformation
+               // fails here by 1.70 (order 1) and nowhere else. Order 0 does
+               // not see the second because an order-0 total flux has no
+               // element-interior dofs and that pass returns early.
+               RequireSameVector(ref.ut, got.ut, "total flux");
+               RequireSameVector(ref.u_s, got.u_s, "enriched flux");
+               RequireSameVector(ref.p_s, got.p_s, "enriched potential");
+               RequireSameVector(ref.tr_s, got.tr_s, "enriched trace");
+            }
+         }
+      }
+   }
+
+   omp_set_num_threads(saved_threads);
+#else
+   WARN("The threaded reconstruction needs MFEM_USE_OPENMP and "
+        "MFEM_THREAD_SAFE; this build has neither or only one, so nothing "
+        "was checked.");
+#endif
+}
+
+TEST_CASE("The reconstruction threads only when the caller has promised",
+          "[DarcyHybridization][AssemblyMode][Reconstruction]")
+{
+   // The gate is deliberately two conditions, not one. AssemblyMode::Threaded
+   // alone is what every other element loop here takes, and those loops
+   // evaluate only the nonlinear handles; this one additionally evaluates
+   // c_bfi's AssembleFaceMatrix() and c_bfi_p's AssembleHDGFaceMatrix(),
+   // which are LINEAR face integrators and so outside what MultNL()'s audit
+   // ever covered. SetIntegratorsThreadSafe() is where the caller takes
+   // those on, so without it this routine stays serial however the mode is
+   // set -- and a caller who never read any of this keeps the loop they had.
+   //
+   // Checked here rather than inferred, because the two accessors are the
+   // whole gate and a future edit that drops one of them would be silent:
+   // the answers agree either way, which is the point of the case above.
+   Mesh mesh = Mesh::MakeCartesian2D(2, 2, Element::QUADRILATERAL);
+   L2_FECollection u_coll(0, 2, BasisType::GaussLobatto);
+   L2_FECollection p_coll(0, 2);
+   FiniteElementSpace fes_u(&mesh, &u_coll, 2);
+   FiniteElementSpace fes_p(&mesh, &p_coll);
+   DarcyForm darcy(&fes_u, &fes_p);
+
+   Array<int> ess;
+   DG_Interface_FECollection trace_coll(0, 2);
+   FiniteElementSpace fes_t(&mesh, &trace_coll);
+   darcy.EnableHybridization(&fes_t, new NormalTraceJumpIntegrator(), ess);
+
+   DarcyHybridization *dh = darcy.GetHybridization();
+   REQUIRE_FALSE(dh->GetIntegratorsThreadSafe());
+   REQUIRE(dh->GetAssemblyMode() ==
+           DarcyHybridization::AssemblyMode::Serial);
+
+   dh->SetIntegratorsThreadSafe();
+   REQUIRE(dh->GetIntegratorsThreadSafe());
+   // The mode is still Serial, so the promise on its own licenses nothing.
+   REQUIRE(dh->GetAssemblyMode() ==
+           DarcyHybridization::AssemblyMode::Serial);
+}
+
+namespace darcy_threaded_assembly
+{
+
+/// A coefficient that throws on one element and is 1 everywhere else. It
+/// throws a std::runtime_error rather than calling MFEM_ABORT so that the
+/// cases below run in a build without MFEM_USE_EXCEPTIONS too: what they are
+/// about is the OpenMP region, which does not care what was thrown.
+class ThrowOnElement : public Coefficient
+{
+   const int el;
+public:
+   explicit ThrowOnElement(int el_) : el(el_) { }
+   real_t Eval(ElementTransformation &T, const IntegrationPoint &) override
+   {
+      if (T.ElementNo == el) { throw std::runtime_error("ThrowOnElement"); }
+      return 1.0;
+   }
+};
+
+/// CubeSource that throws on one element once armed, so the forms assemble
+/// and the throw lands in the residual's element loop.
+class ThrowingCube : public CubeSource
+{
+   const int el;
+public:
+   bool armed = false;
+   explicit ThrowingCube(int el_) : CubeSource(1.0), el(el_) { }
+   void AssembleElementVector(const FiniteElement &fe, ElementTransformation &Tr,
+                              const Vector &elfun, Vector &elvect) override
+   {
+      if (armed && Tr.ElementNo == el)
+      {
+         throw std::runtime_error("ThrowingCube");
+      }
+      CubeSource::AssembleElementVector(fe, Tr, elfun, elvect);
+   }
+};
+
+enum class Thrower { FluxMass, PotMass, Residual };
+
+/// Build a small hybridized problem whose @a which part throws on element
+/// @a el, and run it as far as the throw.
+void RunToThrow(Thrower which, int el, DarcyHybridization::AssemblyMode mode)
+{
+   Mesh mesh = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+   const int order = 1, dim = 2;
+   L2_FECollection u_coll(order, dim, BasisType::GaussLobatto);
+   L2_FECollection p_coll(order, dim);
+   DG_Interface_FECollection t_coll(order, dim);
+   FiniteElementSpace Vh(&mesh, &u_coll, dim), Wh(&mesh, &p_coll),
+                      Mh(&mesh, &t_coll);
+
+   ConstantCoefficient one(1.0);
+   ThrowOnElement thrower(el);
+   DarcyForm darcy(&Vh, &Wh);
+   darcy.GetFluxMassForm()->AddDomainIntegrator(new VectorMassIntegrator(
+                                                   (which == Thrower::FluxMass) ? (Coefficient&)thrower : one));
+
+   Array<int> all(mesh.bdr_attributes.Max());
+   all = 1;
+   ThrowingCube *cube = nullptr;
+   if (which == Thrower::Residual)
+   {
+      NonlinearForm *Mnl_p = darcy.GetPotentialMassNonlinearForm();
+      cube = new ThrowingCube(el);
+      Mnl_p->AddDomainIntegrator(cube);
+      Mnl_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0));
+      Mnl_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0), all);
+   }
+   else
+   {
+      BilinearForm *M_p = darcy.GetPotentialMassForm();
+      M_p->AddDomainIntegrator(new MassIntegrator(
+                                  (which == Thrower::PotMass) ? (Coefficient&)thrower : one));
+      M_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0));
+      M_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0), all);
+   }
+
+   MixedBilinearForm *B = darcy.GetFluxDivForm();
+   B->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   B->AddInteriorFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-1.0)));
+   B->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-2.0)), all);
+
+   Array<int> ess_flux;
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+   DarcyHybridization &dh = *darcy.GetHybridization();
+   dh.SetEssentialBC(all);
+   dh.SetLocalNLSolver(DarcyHybridization::LSsolveType::Newton, 100, 1e-12,
+                       1e-16, -1);
+   // True of every integrator here: the coefficient and ThrowingCube share
+   // nothing between threads, throwing aside.
+   dh.SetIntegratorsThreadSafe();
+   dh.SetAssemblyMode(mode);
+   darcy.Assemble();   // the two mass cases throw here
+
+   Array<int> offs(4);
+   offs[0] = 0;
+   offs[1] = Vh.GetVSize();
+   offs[2] = Wh.GetVSize();
+   offs[3] = Mh.GetVSize();
+   offs.PartialSum();
+   BlockVector sol(offs), rhs(offs);
+   sol = 0.0;
+   rhs = 0.0;
+   Vector X, RHS;
+   OperatorPtr R;
+   X.MakeRef(sol, offs[2], Mh.GetVSize());
+   RHS.MakeRef(rhs, offs[2], Mh.GetVSize());
+   BlockVector dsol(sol, darcy.GetOffsets()), drhs(rhs, darcy.GetOffsets());
+   darcy.FormLinearSystem(ess_flux, dsol, drhs, R, X, RHS, true);
+
+   Vector x(Mh.GetVSize()), r(Mh.GetVSize());
+   for (int i = 0; i < x.Size(); i++) { x(i) = 0.25 * std::sin(1.0 + 3.0 * i); }
+   if (cube) { cube->armed = true; }
+   R->Mult(x, r);      // and the residual case here
+}
+
+/// gffp's configuration: a flux mass on 1/kappa at kappa = 0.
+void AssembleAtZeroKappa(DarcyHybridization::AssemblyMode mode)
+{
+   Mesh mesh = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+   L2_FECollection u_coll(1, 2, BasisType::GaussLobatto), p_coll(1, 2);
+   DG_Interface_FECollection t_coll(1, 2);
+   FiniteElementSpace Vh(&mesh, &u_coll, 2), Wh(&mesh, &p_coll),
+                      Mh(&mesh, &t_coll);
+   ConstantCoefficient kappa(0.0), one(1.0);
+   RatioCoefficient ik(1.0, kappa);
+   DarcyForm darcy(&Vh, &Wh);
+   darcy.GetFluxMassForm()->AddDomainIntegrator(new VectorMassIntegrator(ik));
+   darcy.GetFluxDivForm()->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   darcy.GetPotentialMassForm()->AddInteriorFaceIntegrator(
+      new HDGDiffusionIntegrator(one, 1.0));
+   Array<int> ess_flux;
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+   darcy.GetHybridization()->SetIntegratorsThreadSafe();
+   darcy.GetHybridization()->SetAssemblyMode(mode);
+   darcy.Assemble();
+}
+
+/// AssemblyMode::Threaded is refused (MFEM_ABORT) unless the build has both.
+bool CanRequestThreaded()
+{
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE)
+   return true;
+#else
+   return false;
+#endif
+}
+
+/// Run @a check at one thread and at four, or once without OpenMP. One thread
+/// is not the trivial arm: the region is opened all the same.
+template <typename F> void AtOneAndFourThreads(F &&check)
+{
+#ifdef MFEM_USE_OPENMP
+   const int saved_threads = omp_get_max_threads();
+   for (int nt : {1, 4})
+   {
+      CAPTURE(nt);
+      omp_set_num_threads(nt);
+      check();
+   }
+   omp_set_num_threads(saved_threads);
+#else
+   check();
+#endif
+}
+
+} // namespace darcy_threaded_assembly
+
+TEST_CASE("An exception inside a threaded element loop reaches the caller",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // gffp's report, 2026-09-25. An exception may not leave an OpenMP
+   // structured block, and `#pragma omp parallel if (false)` still opens one,
+   // so once DarcyForm::Assemble()'s loops were threaded every error raised
+   // inside them became std::terminate -- in AssemblyMode::Serial too, and at
+   // one thread. Each arm below aborted the process before
+   // ThreadedExceptionTrap. Without MFEM_USE_OPENMP there is no region and
+   // the case is a plain check that the throw propagates.
+   using AM = DarcyHybridization::AssemblyMode;
+   const Thrower which = GENERATE(Thrower::FluxMass, Thrower::PotMass,
+                                  Thrower::Residual);
+   const AM mode = GENERATE(AM::Serial, AM::Threaded);
+   // Two elements a colour apart, so that at four threads two throws can be
+   // in flight at once -- the "terminate called recursively" of the report.
+   const int el = GENERATE(0, 5);
+   CAPTURE((int)which, (int)mode, el);
+
+   if (mode == AM::Threaded && !CanRequestThreaded()) { return; }
+   AtOneAndFourThreads([&]()
+   {
+      REQUIRE_THROWS_AS(RunToThrow(which, el, mode), std::runtime_error);
+   });
+}
+
+#ifdef MFEM_USE_EXCEPTIONS
+TEST_CASE("A non-finite flux mass is refused from a threaded loop too",
+          "[DarcyHybridization][AssemblyMode]")
+{
+   // gffp's literal configuration: VectorMassIntegrator(1/kappa) at
+   // kappa = 0, which AssembleFluxMassMatrix()'s finiteness guard refuses by
+   // name. The message is asserted, not just the throw, because it is what
+   // told gffp what to do instead.
+   using AM = DarcyHybridization::AssemblyMode;
+   const AM mode = GENERATE(AM::Serial, AM::Threaded);
+   CAPTURE((int)mode);
+   if (mode == AM::Threaded && !CanRequestThreaded()) { return; }
+
+   AtOneAndFourThreads([&]()
+   {
+      REQUIRE_THROWS_WITH(AssembleAtZeroKappa(mode),
+                          Catch::Matchers::Contains("has a non-finite entry"));
+   });
+}
+#endif // MFEM_USE_EXCEPTIONS

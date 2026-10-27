@@ -1,0 +1,327 @@
+// Copyright (c) 2010-2026, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#include "cpardiso.hpp"
+#include "hypre.hpp"
+#include <algorithm>
+#include <vector>
+#include <numeric>
+
+#ifdef MFEM_USE_MPI
+#ifdef MFEM_USE_MKL_CPARDISO
+
+namespace mfem
+{
+CPardisoSolver::CPardisoSolver(MPI_Comm comm)
+{
+   comm_ = MPI_Comm_c2f(comm);
+
+   // Indicate that default parameters are changed
+   iparm[0] = 1;
+   // Use METIS for fill-in reordering
+   iparm[1] = 2;
+   // Do not write the solution into the x vector data
+   iparm[5] = 0;
+   // Maximum number of iterative refinement steps
+   iparm[7] = 2;
+   // Perturb the pivot elements with 1E-13
+   iparm[9] = 13;
+   // Use nonsymmetric permutation
+   iparm[10] = 1;
+   // Perform a check on the input data
+   iparm[26] = 1;
+#ifdef MFEM_USE_SINGLE
+   // Single precision
+   iparm[27] = 1;
+#endif
+   // 0-based indexing in CSR data structure
+   iparm[34] = 1;
+   // All inputs are distributed between MPI processes
+   iparm[39] = 2;
+   // Maximum number of numerical factorizations
+   maxfct = 1;
+   // Which factorization to use. This parameter is ignored and always assumed
+   // to be equal to 1. See MKL documentation.
+   mnum = 1;
+   // Print statistical information in file
+   msglvl = 0;
+   // Initialize error flag
+   error = 0;
+   // Real nonsymmetric matrix
+   mtype = MatType::REAL_NONSYMMETRIC;
+   // Number of right hand sides
+   nrhs = 1;
+};
+
+void CPardisoSolver::ReleaseFactorization()
+{
+   if (!factored) { return; }
+
+   // Release all internal memory held for the current factorization. Without
+   // this a second analysis on the same handle leaks whatever the first one
+   // allocated inside MKL.
+   phase = -1;
+   cluster_sparse_solver(pt,
+                         &maxfct,
+                         &mnum,
+                         &mtype,
+                         &phase,
+                         &m,
+                         reordered_csr_nzval,
+                         csr_rowptr,
+                         reordered_csr_colind,
+                         &idum,
+                         &nrhs,
+                         iparm,
+                         &msglvl,
+                         &ddum,
+                         &ddum,
+                         &comm_,
+                         &error);
+
+   MFEM_ASSERT(error == 0, "CPardiso free error");
+
+   factored = false;
+}
+
+void CPardisoSolver::SetReuseSymbolic(bool reuse)
+{
+   reuse_symbolic = reuse;
+   if (!reuse)
+   {
+      pattern.Clear();
+      pattern_first_row = -1;
+   }
+}
+
+void CPardisoSolver::SetOperator(const Operator &op)
+{
+   auto hypreParMat = dynamic_cast<const HypreParMatrix &>(op);
+
+   MFEM_ASSERT(hypreParMat, "Must pass HypreParMatrix as Operator");
+
+   auto parcsr_op = static_cast<hypre_ParCSRMatrix *>(
+                       const_cast<HypreParMatrix &>(hypreParMat));
+
+   hypreParMat.HostRead();
+   hypre_CSRMatrix *csr_op = hypre_MergeDiagAndOffd(parcsr_op);
+   hypreParMat.HypreRead();
+#if MFEM_HYPRE_VERSION >= 21600
+   hypre_CSRMatrixBigJtoJ(csr_op);
+#endif
+
+   m = parcsr_op->global_num_rows;
+   first_row = parcsr_op->first_row_index;
+   nnz_loc = csr_op->num_nonzeros;
+   m_loc = csr_op->num_rows;
+
+   height = m_loc;
+   width = m_loc;
+
+   real_t *csr_nzval = csr_op->data;
+   int *csr_colind = csr_op->j;
+
+   // The local CSR has to be built before it can be compared, so what reuse
+   // saves here is the analysis, not the assembly of the copy.
+   int *new_csr_rowptr = new int[m_loc + 1];
+   int *new_csr_colind = new int[nnz_loc];
+   real_t *new_csr_nzval = new real_t[nnz_loc];
+
+   for (int i = 0; i <= m_loc; i++)
+   {
+      new_csr_rowptr[i] = (csr_op->i)[i];
+   }
+
+   // CPardiso expects the column indices to be sorted for each row
+   std::vector<int> permutation_idx(nnz_loc);
+   std::iota(permutation_idx.begin(), permutation_idx.end(), 0);
+   for (int i = 0; i < m_loc; i++)
+   {
+      std::sort(permutation_idx.begin() + new_csr_rowptr[i],
+                permutation_idx.begin() + new_csr_rowptr[i + 1],
+                [csr_colind](int i1, int i2)
+      {
+         return csr_colind[i1] < csr_colind[i2];
+      });
+   }
+
+   for (int i = 0; i < nnz_loc; i++)
+   {
+      new_csr_colind[i] = csr_colind[permutation_idx[i]];
+      new_csr_nzval[i] = csr_nzval[permutation_idx[i]];
+   }
+
+   hypre_CSRMatrixDestroy(csr_op);
+
+   // Whether the analysis in hand was made for this pattern. Checked against
+   // the pattern itself, never assumed; see SetReuseSymbolic().
+   int reuse_here = (reuse_symbolic && factored &&
+                     first_row == pattern_first_row &&
+                     pattern.Matches(m_loc, nnz_loc, new_csr_rowptr,
+                                     new_csr_colind)) ? 1 : 0;
+
+   // cluster_sparse_solver() is collective, so the decision has to be. A rank
+   // that skipped phase 11 while another ran it would leave the two of them in
+   // different calls, and the run would hang rather than fail.
+   int reuse_all = reuse_here;
+   MPI_Allreduce(&reuse_here, &reuse_all, 1, MPI_INT, MPI_MIN,
+                 MPI_Comm_f2c(comm_));
+   const bool reuse = (reuse_all == 1);
+
+   if (!reuse) { ReleaseFactorization(); }
+
+   delete[] csr_rowptr;
+   delete[] reordered_csr_colind;
+   delete[] reordered_csr_nzval;
+   csr_rowptr = new_csr_rowptr;
+   reordered_csr_colind = new_csr_colind;
+   reordered_csr_nzval = new_csr_nzval;
+
+   // iparm[40], the number of row in global matrix, rhs element and solution vector that
+   // begins the input domain belonging to this MPI process
+
+   // iparm[41], the number of row in global matrix, rhs element and solution vector that
+   // ends the input domain belonging to this MPI process
+   if (m_loc == 0 && first_row == 0)
+   {
+      // Workaround for the issue https://github.com/mfem/mfem/issues/4634
+      iparm[40] = 1;
+      iparm[41] = first_row;
+   }
+   else
+   {
+      iparm[40] = first_row;
+      iparm[41] = first_row + m_loc - 1;
+   }
+
+   if (!reuse)
+   {
+      // Analyze inputs
+      phase = 11;
+      cluster_sparse_solver(pt,
+                            &maxfct,
+                            &mnum,
+                            &mtype,
+                            &phase,
+                            &m,
+                            reordered_csr_nzval,
+                            csr_rowptr,
+                            reordered_csr_colind,
+                            &idum,
+                            &nrhs,
+                            iparm,
+                            &msglvl,
+                            &ddum,
+                            &ddum,
+                            &comm_,
+                            &error);
+
+      MFEM_ASSERT(error == 0, "CPardiso analyze input error");
+
+      num_symbolic++;
+      if (reuse_symbolic)
+      {
+         pattern.Set(m_loc, nnz_loc, csr_rowptr, reordered_csr_colind);
+         pattern_first_row = first_row;
+      }
+   }
+
+   // Numerical factorization
+   phase = 22;
+   cluster_sparse_solver(pt,
+                         &maxfct,
+                         &mnum,
+                         &mtype,
+                         &phase,
+                         &m,
+                         reordered_csr_nzval,
+                         csr_rowptr,
+                         reordered_csr_colind,
+                         &idum,
+                         &nrhs,
+                         iparm,
+                         &msglvl,
+                         &ddum,
+                         &ddum,
+                         &comm_,
+                         &error);
+
+   MFEM_ASSERT(error == 0, "CPardiso factorization input error");
+
+   num_numeric++;
+   factored = true;
+}
+
+void CPardisoSolver::Mult(const Vector &b, Vector &x) const
+{
+   // Solve
+   phase = 33;
+   // **The host accessors, not Vector::GetData().** GetData() is a raw host
+   // pointer: it neither brings a device-resident right-hand side down nor
+   // invalidates the device copy of the solution written here. With an
+   // mfem::Device configured, the solver therefore factored the right matrix
+   // -- SetOperator() above is careful, hypreParMat.HostRead() -- and then
+   // solved against a stale b, returning an x that no device consumer ever
+   // saw. UMFPackSolver::Mult() is the contrast and it is in this same
+   // directory. Reported against the serial PardisoSolver; this sibling
+   // carries the same two calls and is fixed with it.
+   //
+   // HostWrite() rather than HostReadWrite() because phase 33 with
+   // iparm[5] = 0 overwrites x entirely and never reads it on entry; a mode
+   // that does read it would need HostReadWrite(). The const_cast is for
+   // PARDISO's signature, which takes a non-const void * for the
+   // right-hand side.
+   cluster_sparse_solver(pt,
+                         &maxfct,
+                         &mnum,
+                         &mtype,
+                         &phase,
+                         &m,
+                         reordered_csr_nzval,
+                         csr_rowptr,
+                         reordered_csr_colind,
+                         &idum,
+                         &nrhs,
+                         iparm,
+                         &msglvl,
+                         const_cast<real_t *>(b.HostRead()),
+                         x.HostWrite(),
+                         &comm_,
+                         &error);
+
+   MFEM_ASSERT(error == 0, "Pardiso solve error");
+}
+
+void CPardisoSolver::SetPrintLevel(int print_level)
+{
+   msglvl = print_level;
+}
+
+void CPardisoSolver::SetMatrixType(MatType mat_type)
+{
+   mtype = mat_type;
+}
+
+CPardisoSolver::~CPardisoSolver()
+{
+   // Release all internal memory. There is none to release, and no matrix to
+   // name in the call, if SetOperator() was never reached.
+   ReleaseFactorization();
+
+   delete[] csr_rowptr;
+   delete[] reordered_csr_colind;
+   delete[] reordered_csr_nzval;
+}
+
+} // namespace mfem
+
+#endif // MFEM_USE_MKL_CPARDISO
+#endif // MFEM_USE_MPI

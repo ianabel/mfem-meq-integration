@@ -1,0 +1,651 @@
+// Copyright (c) 2010-2026, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#include "unit_tests.hpp"
+#include "mfem.hpp"
+
+using namespace mfem;
+
+#ifdef MFEM_USE_SUITESPARSE
+#define DIRECT_SOLVE_SERIAL
+#endif
+#ifdef MFEM_USE_MKL_PARDISO
+#define DIRECT_SOLVE_SERIAL
+#endif
+#ifdef MFEM_USE_MUMPS
+#define DIRECT_SOLVE_PARALLEL
+#endif
+#ifdef MFEM_USE_SUPERLU
+#define DIRECT_SOLVE_PARALLEL
+#endif
+#ifdef MFEM_USE_STRUMPACK
+#define DIRECT_SOLVE_PARALLEL
+#endif
+
+#if defined(DIRECT_SOLVE_SERIAL) || defined(DIRECT_SOLVE_PARALLEL)
+
+double uexact(const Vector &x)
+{
+   double u;
+   switch (x.Size())
+   {
+      case 1:
+         u  = 3.0 + 2.0 * x(0) - 0.5 * x(0) * x(0);
+         break;
+      case 2:
+         u = 1.0 + 0.2 * x(0) - 0.9 * x(0) * x(1) + x(1) * x(1) * x(0);
+         break;
+      default:
+         u = x(2) * x(2) * x(2) - 5.0 * x(0) * x(0) * x(1) * x(2);
+         break;
+   }
+   return u;
+}
+
+void gradexact(const Vector &x, Vector &grad)
+{
+   grad.SetSize(x.Size());
+   switch (x.Size())
+   {
+      case 1:
+         grad[0] = 2.0 - x(0);
+         break;
+      case 2:
+         grad[0] = 0.2 - 0.9 * x(1) + x(1) * x(1);
+         grad[1] = - 0.9 * x(0) + 2.0 * x(0) * x(1);
+         break;
+      default:
+         grad[0] = -10.0 * x(0) * x(1) * x(2);
+         grad[1] = - 5.0 * x(0) * x(0) * x(2);
+         grad[2] = 3.0 * x(2) * x(2) - 5.0 * x(0) * x(0) * x(1);
+         break;
+   }
+}
+
+double d2uexact(const Vector& x) // returns \Delta u
+{
+   double d2u;
+   switch (x.Size())
+   {
+      case 1:
+         d2u  = -1.0;
+         break;
+      case 2:
+         d2u = 2.0 * x(0);
+         break;
+      default:
+         d2u = -10.0 * x(1) * x(2) + 6.0 * x(2);
+         break;
+   }
+   return d2u;
+}
+
+double fexact(const Vector &x) // returns -\Delta u
+{
+   double d2u = d2uexact(x);
+   return -d2u;
+}
+
+#endif
+
+#ifdef DIRECT_SOLVE_SERIAL
+
+TEST_CASE("Serial Direct Solvers", "[GPU]")
+{
+   const int ne = 2;
+   for (int dim = 1; dim < 4; ++dim)
+   {
+      Mesh mesh;
+      if (dim == 1)
+      {
+         mesh = Mesh::MakeCartesian1D(ne, 1.0);
+      }
+      else if (dim == 2)
+      {
+         mesh = Mesh::MakeCartesian2D(
+                   ne, ne, Element::QUADRILATERAL, 1, 1.0, 1.0);
+      }
+      else
+      {
+         mesh = Mesh::MakeCartesian3D(
+                   ne, ne, ne, Element::HEXAHEDRON, 1.0, 1.0, 1.0);
+      }
+      int order = 3;
+      H1_FECollection fec(order, dim);
+      FiniteElementSpace fespace(&mesh, &fec);
+      Array<int> ess_tdof_list, ess_bdr(mesh.bdr_attributes.Max());
+      ess_bdr = 1;
+      fespace.GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+
+      FunctionCoefficient f(fexact);
+      LinearForm b(&fespace);
+      b.AddDomainIntegrator(new DomainLFIntegrator(f));
+      b.Assemble();
+
+      BilinearForm a(&fespace);
+      ConstantCoefficient one(1.0);
+      a.AddDomainIntegrator(new DiffusionIntegrator(one));
+      a.Assemble();
+
+      GridFunction x(&fespace);
+      FunctionCoefficient uex(uexact);
+      x = 0.0;
+      x.ProjectBdrCoefficient(uex, ess_bdr);
+
+      OperatorPtr A;
+      Vector B, X;
+      a.FormLinearSystem(ess_tdof_list, x, b, A, X, B);
+
+#ifdef MFEM_USE_SUITESPARSE
+      {
+         UMFPackSolver umf_solver;
+         umf_solver.Control[UMFPACK_ORDERING] = UMFPACK_ORDERING_METIS;
+         umf_solver.SetOperator(*A);
+         umf_solver.Mult(B, X);
+
+         Vector Y(X.Size());
+         A->Mult(X, Y);
+         Y -= B;
+         REQUIRE(Y.Norml2() < 1.e-12);
+
+         a.RecoverFEMSolution(X, b, x);
+         VectorFunctionCoefficient grad(dim, gradexact);
+         double error = x.ComputeH1Error(&uex, &grad);
+         REQUIRE(error < 1.e-12);
+      }
+#endif
+#ifdef MFEM_USE_MKL_PARDISO
+      {
+         PardisoSolver pardiso_solver;
+         pardiso_solver.SetOperator(*A);
+         pardiso_solver.Mult(B, X);
+
+         Vector Y(X.Size());
+         A->Mult(X, Y);
+         Y -= B;
+         REQUIRE(Y.Norml2() < 1.e-12);
+
+         a.RecoverFEMSolution(X, b, x);
+         VectorFunctionCoefficient grad(dim, gradexact);
+         double error = x.ComputeH1Error(&uex, &grad);
+         REQUIRE(error < 1.e-12);
+      }
+#endif
+   }
+}
+
+#endif
+
+#ifdef MFEM_USE_MKL_PARDISO
+
+// PardisoSolver::ArrayMult() against the one-column route it replaces.
+//
+// The residual alone is a weak check here: a packing that got the stride or
+// the ordering wrong would still return SOMETHING for every column, and a
+// column of it would still be the solve of a right-hand side -- just not the
+// one that was asked for. So each column is required to match the answer
+// Mult() gives for that same column, and the right-hand sides are made
+// pairwise different so that a transposed or offset packing cannot land on a
+// column that happens to be right.
+TEST_CASE("Pardiso solves several right-hand sides in one pass", "[Pardiso]")
+{
+   const int dim = 2, ne = 8, order = 2, ncols = 4;
+
+   Mesh mesh = Mesh::MakeCartesian2D(ne, ne, Element::QUADRILATERAL, 1, 1.0,
+                                     1.0);
+   H1_FECollection fec(order, dim);
+   FiniteElementSpace fespace(&mesh, &fec);
+
+   Array<int> ess_tdof_list, ess_bdr(mesh.bdr_attributes.Max());
+   ess_bdr = 1;
+   fespace.GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+
+   ConstantCoefficient one(1.0);
+   BilinearForm a(&fespace);
+   a.AddDomainIntegrator(new DiffusionIntegrator(one));
+   a.Assemble();
+
+   FunctionCoefficient f(fexact);
+   LinearForm b(&fespace);
+   b.AddDomainIntegrator(new DomainLFIntegrator(f));
+   b.Assemble();
+
+   GridFunction x(&fespace);
+   x = 0.0;
+
+   OperatorPtr A;
+   Vector B, X;
+   a.FormLinearSystem(ess_tdof_list, x, b, A, X, B);
+
+   const int n = B.Size();
+
+   // Pairwise different right-hand sides, and none a multiple of another.
+   Array<Vector *> BB(ncols), XX(ncols), XX_ref(ncols);
+   for (int j = 0; j < ncols; j++)
+   {
+      BB[j] = new Vector(n);
+      XX[j] = new Vector(n);
+      XX_ref[j] = new Vector(n);
+      for (int i = 0; i < n; i++)
+      {
+         (*BB[j])(i) = B(i) * (1.0 + 0.25 * j) + std::sin(0.5 * i + j);
+      }
+      *XX[j] = 0.0;
+      *XX_ref[j] = 0.0;
+   }
+
+   PardisoSolver pardiso;
+   pardiso.SetOperator(*A);
+
+   // The reference: one column at a time, which is what the loop in
+   // Operator::ArrayMult() would do.
+   for (int j = 0; j < ncols; j++) { pardiso.Mult(*BB[j], *XX_ref[j]); }
+
+   pardiso.ArrayMult(BB, XX);
+
+   Vector Y(n);
+   for (int j = 0; j < ncols; j++)
+   {
+      CAPTURE(j);
+      // Before any norm: Vector::Norml2() skips NaN entries rather than
+      // propagating them (fabs(NaN) > 0 is false), so a solve that returned
+      // nothing but NaN would pass a residual assertion with |r| == 0.
+      REQUIRE(XX[j]->CheckFinite() == 0);
+
+      A->Mult(*XX[j], Y);
+      Y -= *BB[j];
+      REQUIRE(Y.Norml2() < 1.e-10 * BB[j]->Norml2());
+
+      Vector d(*XX[j]);
+      d -= *XX_ref[j];
+      REQUIRE(d.Norml2() <= 1.e-12 * XX_ref[j]->Norml2());
+   }
+
+   // A single-column solve AFTER a blocked one. PARDISO reads the column
+   // count from the solver, so a blocked call that left it behind would have
+   // this write ncols*n entries into an n-sized vector.
+   Vector x1(n);
+   x1 = 0.0;
+   pardiso.Mult(*BB[0], x1);
+   REQUIRE(x1.CheckFinite() == 0);
+   Vector d1(x1);
+   d1 -= *XX_ref[0];
+   REQUIRE(d1.Norml2() <= 1.e-12 * XX_ref[0]->Norml2());
+
+   // One column through the blocked entry point is the same solve again.
+   Array<Vector *> B1(1), X1(1);
+   Vector xs(n);
+   xs = 0.0;
+   B1[0] = BB[0];
+   X1[0] = &xs;
+   pardiso.ArrayMult(B1, X1);
+   Vector ds(xs);
+   ds -= *XX_ref[0];
+   REQUIRE(ds.Norml2() <= 1.e-12 * XX_ref[0]->Norml2());
+
+   for (int j = 0; j < ncols; j++)
+   {
+      delete BB[j];
+      delete XX[j];
+      delete XX_ref[j];
+   }
+}
+
+#endif // MFEM_USE_MKL_PARDISO
+
+#ifdef DIRECT_SOLVE_PARALLEL
+
+TEST_CASE("Parallel Direct Solvers", "[Parallel], [GPU]")
+{
+   int rank;
+   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+   const int ne = 4;
+   for (int dim = 1; dim < 4; ++dim)
+   {
+      CAPTURE(dim);
+
+      Mesh mesh;
+      if (dim == 1)
+      {
+         mesh = Mesh::MakeCartesian1D(ne, 1.0);
+      }
+      else if (dim == 2)
+      {
+         mesh = Mesh::MakeCartesian2D(
+                   ne, ne, Element::QUADRILATERAL, 1, 1.0, 1.0);
+      }
+      else
+      {
+         mesh = Mesh::MakeCartesian3D(
+                   ne, ne, ne, Element::HEXAHEDRON, 1.0, 1.0, 1.0);
+      }
+
+      ParMesh pmesh(MPI_COMM_WORLD, mesh);
+      mesh.Clear();
+      int order = 3;
+      H1_FECollection fec(order, dim);
+      ParFiniteElementSpace fespace(&pmesh, &fec);
+      Array<int> ess_tdof_list, ess_bdr;
+      if (pmesh.bdr_attributes.Size())
+      {
+         ess_bdr.SetSize(pmesh.bdr_attributes.Max());
+         ess_bdr = 1;
+         fespace.GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+      }
+      FunctionCoefficient f(fexact);
+      ParLinearForm b(&fespace);
+      b.AddDomainIntegrator(new DomainLFIntegrator(f));
+      b.Assemble();
+
+      ParBilinearForm a(&fespace);
+      ConstantCoefficient one(1.0);
+      a.AddDomainIntegrator(new DiffusionIntegrator(one));
+      a.Assemble();
+
+      ParGridFunction x(&fespace);
+      FunctionCoefficient uex(uexact);
+      x = 0.0;
+      x.ProjectBdrCoefficient(uex, ess_bdr);
+
+      OperatorPtr A;
+      Vector B, X;
+      a.FormLinearSystem(ess_tdof_list, x, b, A, X, B);
+
+      Vector B0(X.Size()), B1(X.Size()), X0(X.Size()), X1(X.Size());
+      B0 = B;
+      B1 = B;
+      B1 *= 2.0;
+      Array<Vector *> BB(2), XX(2);
+      BB[0] = &B0;
+      BB[1] = &B1;
+      XX[0] = &X0;
+      XX[1] = &X1;
+
+#ifdef MFEM_USE_MUMPS
+      SECTION("MUMPSSolver")
+      {
+         MUMPSSolver mumps(MPI_COMM_WORLD);
+         mumps.SetPrintLevel(0);
+         mumps.SetOperator(*A.As<HypreParMatrix>());
+         mumps.Mult(B, X);
+
+         Vector Y(X.Size());
+         A->Mult(X, Y);
+         Y -= B;
+         REQUIRE(Y.Norml2() < 1.e-12);
+
+         mumps.ArrayMult(BB, XX);
+
+         for (int i = 0; i < XX.Size(); i++)
+         {
+            A->Mult(*XX[i], Y);
+            Y -= *BB[i];
+            REQUIRE(Y.Norml2() < 1.e-12);
+         }
+
+         a.RecoverFEMSolution(X, b, x);
+         VectorFunctionCoefficient grad(dim, gradexact);
+         double error = x.ComputeH1Error(&uex, &grad);
+         REQUIRE(error < 1.e-12);
+      }
+#endif
+#ifdef MFEM_USE_SUPERLU
+      SECTION("SuperLUSolver")
+      {
+         // Transform to monolithic HypreParMatrix
+         SuperLURowLocMatrix SA(*A.As<HypreParMatrix>());
+         SuperLUSolver superlu(MPI_COMM_WORLD);
+         superlu.SetPrintStatistics(false);
+         superlu.SetSymmetricPattern(false);
+         superlu.SetColumnPermutation(superlu::METIS_AT_PLUS_A);
+         superlu.SetOperator(SA);
+         superlu.Mult(B, X);
+
+         Vector Y(X.Size());
+         A->Mult(X, Y);
+         Y -= B;
+         REQUIRE(Y.Norml2() < 1.e-12);
+
+         // SuperLUSolver requires constant number of RHS across solves
+         SuperLURowLocMatrix SA2(*A.As<HypreParMatrix>());
+         SuperLUSolver superlu2(MPI_COMM_WORLD);
+         superlu2.SetPrintStatistics(false);
+         superlu2.SetSymmetricPattern(false);
+         superlu2.SetColumnPermutation(superlu::METIS_AT_PLUS_A);
+         superlu2.SetOperator(SA2);
+         superlu2.ArrayMult(BB, XX);
+
+         for (int i = 0; i < XX.Size(); i++)
+         {
+            A->Mult(*XX[i], Y);
+            Y -= *BB[i];
+            REQUIRE(Y.Norml2() < 1.e-12);
+         }
+
+         a.RecoverFEMSolution(X, b, x);
+         VectorFunctionCoefficient grad(dim, gradexact);
+         double error = x.ComputeH1Error(&uex, &grad);
+         REQUIRE(error < 1.e-12);
+      }
+#endif
+#ifdef MFEM_USE_STRUMPACK
+      SECTION("STRUMPACKSolver")
+      {
+         // Transform to monolithic HypreParMatrix
+         STRUMPACKRowLocMatrix SA(*A.As<HypreParMatrix>());
+         STRUMPACKSolver strumpack(MPI_COMM_WORLD);
+         strumpack.SetPrintFactorStatistics(false);
+         strumpack.SetPrintSolveStatistics(false);
+         strumpack.SetKrylovSolver(strumpack::KrylovSolver::DIRECT);
+         strumpack.SetReorderingStrategy(dim > 1 ? strumpack::ReorderingStrategy::METIS :
+                                         strumpack::ReorderingStrategy::NATURAL);
+         strumpack.SetOperator(SA);
+         strumpack.Mult(B, X);
+
+         Vector Y(X.Size());
+         A->Mult(X, Y);
+         Y -= B;
+         REQUIRE(Y.Norml2() < 1.e-12);
+
+         strumpack.ArrayMult(BB, XX);
+
+         for (int i = 0; i < XX.Size(); i++)
+         {
+            A->Mult(*XX[i], Y);
+            Y -= *BB[i];
+            REQUIRE(Y.Norml2() < 1.e-12);
+         }
+
+         a.RecoverFEMSolution(X, b, x);
+         VectorFunctionCoefficient grad(dim, gradexact);
+         double error = x.ComputeH1Error(&uex, &grad);
+         REQUIRE(error < 1.e-12);
+      }
+#endif
+   }
+}
+
+#endif
+
+#ifdef MFEM_USE_SUITESPARSE
+
+// Shared by the two cases below. The serial and parallel unit mains PARTITION
+// the suite on the [Parallel] tag -- unit_test_main.cpp runs "~[Parallel]" and
+// punit_test_main.cpp runs "[Parallel]" -- so a single tagged case is present
+// in exactly one of the two binaries. Both trees link their own BLAS through
+// their own config/user.mk, so both need checking, and that takes two cases
+// over one body rather than one case with both tags.
+static void CheckUMFPackAboveDenseBlockThreshold()
+{
+   // UMFPACK switches to BLAS level-3 kernels once a frontal matrix is big
+   // enough, so a solver that is exact on a small system says nothing about a
+   // large one. This case is sized to cross that threshold deliberately.
+   //
+   // The failure it guards against is not an MFEM defect: if libblas.so.3
+   // resolves to a BLAS whose integer interface or threading layer does not
+   // match what UMFPACK was built against, the factorization is silently
+   // wrong -- exact below the threshold, nonsense above it. This tree names
+   // the oneAPI MKL and its threading layer at LINK time in config/user.mk,
+   // which is what stops it; MKL_THREADING_LAYER=GNU was the older
+   // environment-variable workaround and is no longer needed. On any other
+   // Debian or Ubuntu machine, check where the alternative points:
+   //
+   //    ls -l /etc/alternatives/libblas.so.3-x86_64-linux-gnu
+   //
+   // A 3-D H1 Laplacian, NOT A BANDED SYSTEM, and that choice is measured.
+   // A bandwidth-32 band at n=2000 has frontal matrices too small to reach
+   // the threaded kernels: linked against the bad BLAS it returns 1.2e-14,
+   // so it passed while the defect was fully present. The 3-D operator's
+   // fronts are near-dense, and against the same bad BLAS it gives
+   // |r|/|b| = 3.8e-01 at n=64, 2.7e+45 at n=343 and NaN by n=2197.
+   const int order = 3;
+   Mesh mesh = Mesh::MakeCartesian3D(2, 2, 2, Element::HEXAHEDRON);
+   H1_FECollection fec(order, mesh.Dimension());
+   FiniteElementSpace fes(&mesh, &fec);
+
+   // Diffusion alone on a closed domain with no essential dofs is singular;
+   // the mass term makes it SPD without narrowing the fronts.
+   BilinearForm a(&fes);
+   a.AddDomainIntegrator(new DiffusionIntegrator);
+   a.AddDomainIntegrator(new MassIntegrator);
+   a.Assemble();
+   a.Finalize();
+   SparseMatrix &A = a.SpMat();
+
+   const int n = fes.GetTrueVSize();
+   REQUIRE(n == 343);
+
+   Vector xex(n), b(n), x(n);
+   for (int i = 0; i < n; i++) { xex(i) = std::sin(real_t(i)); }
+   A.Mult(xex, b);
+   x = 0.0;
+
+   UMFPackSolver umf;
+   umf.SetOperator(A);
+   umf.Mult(b, x);
+
+   // FINITENESS FIRST, and this ordering is the point rather than tidiness.
+   // Vector::Norml2() guards its reduction with `if (n > 0)`, and
+   // fabs(NaN) > 0 is false, so NaN entries are SKIPPED: measured, one NaN
+   // among three ones gives sqrt(3), and an all-NaN vector gives 0.
+   // Normlinf() uses fmax(), which by specification returns the non-NaN
+   // argument, so it reports 0 too. A residual test alone therefore PASSES
+   // on a solve that returned nothing but NaN -- which is exactly what the
+   // bad BLAS produces at n >= 2197. Norml1() would propagate the NaN;
+   // CheckFinite() says so directly and names the count.
+   //
+   // At THIS size the residual assertion below is the one that fires --
+   // measured 9.708e+91 against a 1.176e-09 bound, with CheckFinite() still
+   // reporting 0. The finiteness guard is here for the larger-n regime and
+   // for the general class of failure, not because it is the discriminator
+   // at n = 343.
+   INFO("UMFPack returned " << x.CheckFinite() << " non-finite entries of "
+        << n << "; the BLAS behind UMFPACK is mismatched if this is nonzero");
+   REQUIRE(x.CheckFinite() == 0);
+
+   Vector r(n);
+   A.Mult(x, r);
+   r -= b;
+
+   INFO("UMFPack residual " << r.Norml2() << " on an n=" << n
+        << " 3-D H1 system; a large value here usually means the BLAS behind "
+        "UMFPACK is mismatched, not that MFEM is wrong");
+   REQUIRE(r.Norml2() < 1e-10 * b.Norml2());
+
+   x -= xex;
+   REQUIRE(x.Normlinf() < 1e-10);
+}
+
+TEST_CASE("UMFPack is above its dense-block threshold", "[UMFPack]")
+{
+   CheckUMFPackAboveDenseBlockThreshold();
+}
+
+// The same check in the parallel build, which resolves BLAS through its own
+// link line. Every rank runs the same serial factorization; at n = 343 that is
+// cheap, and a per-rank answer is the right granularity anyway, since what is
+// under test is the process's symbol resolution rather than anything
+// distributed.
+TEST_CASE("UMFPack is above its dense-block threshold in a parallel build",
+          "[UMFPack][Parallel]")
+{
+   CheckUMFPackAboveDenseBlockThreshold();
+}
+
+#endif
+
+#ifdef MFEM_USE_MKL_PARDISO
+
+TEST_CASE("PardisoSolver caps and reports its iterative refinement",
+          "[PardisoSolver]")
+{
+   // The refinement control is read by the solve phase, so changing it
+   // between two solves on one factorization must take effect without a
+   // SetOperator(), and the step count MKL reports must respect it.
+   Mesh mesh = Mesh::MakeCartesian2D(4, 4, Element::QUADRILATERAL);
+   H1_FECollection fec(3, 2);
+   FiniteElementSpace fespace(&mesh, &fec);
+   Array<int> ess_tdof_list, ess_bdr(mesh.bdr_attributes.Max());
+   ess_bdr = 1;
+   fespace.GetEssentialTrueDofs(ess_bdr, ess_tdof_list);
+
+   FunctionCoefficient f(fexact), uex(uexact);
+   LinearForm b(&fespace);
+   b.AddDomainIntegrator(new DomainLFIntegrator(f));
+   b.Assemble();
+   BilinearForm a(&fespace);
+   ConstantCoefficient one(1.0);
+   a.AddDomainIntegrator(new DiffusionIntegrator(one));
+   a.Assemble();
+   GridFunction x(&fespace);
+   x = 0.0;
+   x.ProjectBdrCoefficient(uex, ess_bdr);
+   OperatorPtr A;
+   Vector B, X;
+   a.FormLinearSystem(ess_tdof_list, x, b, A, X, B);
+
+   PardisoSolver solver;
+   REQUIRE(solver.GetNumRefinementSteps() == 0);
+   REQUIRE(solver.GetNumPerturbedPivots() == 0);
+   solver.SetOperator(*A);
+   // A well-conditioned SPD matrix: nothing to perturb.
+   REQUIRE(solver.GetNumPerturbedPivots() == 0);
+
+   auto residual = [&]()
+   {
+      Vector Y(X.Size());
+      A->Mult(X, Y);
+      Y -= B;
+      return Y.Norml2();
+   };
+
+   // The first solve runs on the constructor's setting (2); after that the
+   // cap moves between solves on the one factorization.
+   const int caps[] = {2, 1, 0, 2};
+   for (int k = 0; k < 4; k++)
+   {
+      const int cap = caps[k];
+      CAPTURE(cap);
+      if (k > 0) { solver.SetMaxRefinementSteps(cap); }
+      X = 0.0;
+      solver.Mult(B, X);
+      const int steps = solver.GetNumRefinementSteps();
+      INFO("refinement steps " << steps);
+      // The contract is the cap. What MKL actually did here was the cap
+      // exactly, at 2, 1 and 0, with no pivot perturbed: a positive cap is
+      // spent whether or not anything was perturbed.
+      REQUIRE(steps >= 0);
+      REQUIRE(steps <= cap);
+      REQUIRE(residual() < 1e-12);
+   }
+}
+
+#endif // MFEM_USE_MKL_PARDISO

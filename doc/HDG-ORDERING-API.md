@@ -1,0 +1,850 @@
+# Nonlinear `DarcyHybridization`: the reduced operator, and NPC
+
+A technical reference for the two ways this class solves a nonlinear
+hybridized system: the **reduced trace operator**, which condenses first and
+linearises second and hands the outer solver an `Operator` on the **trace**,
+and **NPC**
+(`NPCResidual`/`NPCGradient`/`NPCReduce`/`NPCRecover`, wrapped as
+`DarcyNPCOperator` + `DarcyNPCSolver`), which runs Newton on the **full**
+`(q, u, λ)` system with the Jacobian solved by hybridized elimination.
+
+**A third thing used to be here and is deleted.**
+`NLOrdering::LineariseThenCondense` was an `Operator` on the trace alone
+whose
+local blocks were eliminated by a linear solve against a retained
+linearisation, and its comments claimed it was the NPC method of Nguyen,
+Peraire & Cockburn, JCP 228 (2009) 8841–8855, eqs (14)–(18). It was not: NPC's
+fields are Newton state and a trace-only operator has nowhere to keep them.
+Measured, it was *slower* than the plain condensation on stiff problems and
+failed four configurations that one solves. Sections 3, 4.3, 5.1 and 5.2 of
+this document were about it and are gone with it; what it taught is in the
+doxygen of the things that replaced it.
+
+**Citations are stale and are being kept only as landmarks.** The `file:line`
+references below were read at commit `50c5d75def` and much has moved since —
+the deletion alone removed some 290 lines from `darcyhybridization.cpp`. Treat
+them as "look near here for this", not as coordinates. The names are accurate;
+the numbers are not.
+
+---
+
+## 1. The setup
+
+`DarcyHybridization` hybridizes a mixed system in a flux `u` (called `q` in the
+HDG literature and in the miniapps), a potential `p`, and a trace `λ` living on
+the mesh skeleton. The full system is
+(`fem/darcy/darcyhybridization.hpp:63-69`):
+
+```
+| Mu  ±Bᵀ  Cᵀ | | u |   | bu |
+| B    D   E  | | p | = | bp |
+| C    G   H  | | λ |   | br |
+```
+
+`Mu` is the flux mass, `B` the (generalised) divergence, `D`/`E`/`G`/`H` the
+potential mass and the HDG stabilization contributions, `C` the flux
+constraint. `bsym` (set in the constructor,
+`fem/darcy/darcyhybridization.hpp:690-696`) chooses the sign convention, and
+`±Bᵀ`/`∓B` follow from it.
+
+Static condensation eliminates `u` and `p` **element by element** — the (0,0)
+and (1,1) blocks are block diagonal once the spaces are broken — leaving a
+system in `λ` alone (`fem/darcy/darcyhybridization.hpp:78-92`):
+
+```
+                 | Mu ±Bᵀ |-1 | Cᵀ |
+H  ←  H - [C G]  | B   D  |   | E  |
+                 | Mu ±Bᵀ |-1 | bu |
+br ←  br - [C G] | B   D  |   | bp |
+```
+
+Write `M` for that 2×2 local block on one element. The reduced operator is a
+Schur complement `H − [C G] M⁻¹ [Cᵀ; E]`.
+
+**Where the nonlinearity sits.** Any of five integrator slots can be
+nonlinear, and `IsNonlinear()` is their disjunction
+(`fem/darcy/darcyhybridization.hpp:557`):
+
+| slot | member | set by |
+|---|---|---|
+| flux mass | `m_nlfi_u` | `SetFluxMassNonlinearIntegrator()` |
+| potential mass | `m_nlfi_p` | `SetPotMassNonlinearIntegrator()` |
+| coupled flux+potential | `m_nlfi` | `SetBlockNonlinearIntegrator()` |
+| potential constraint | `c_nlfi_p` | `SetConstraintIntegrators()` |
+| coupled constraint | `c_nlfi` | `SetConstraintIntegrators()` |
+
+`B` is always linear — it is the divergence form — so the (1,0) block of the
+local Jacobian is always `Bf_data`
+(`fem/darcy/darcyhybridization.cpp:3183-3185`). The (0,1) block is **not**
+always `±Bᵀ`: for a flux law `q = D(p) u` the flux residual depends on the
+potential, and the extra term `d(flux residual)/dp` is assembled into
+`Bnl_data` (`fem/darcy/darcyhybridization.hpp:319-338`). That block is the
+subject of §5.4.
+
+If nothing is nonlinear, `Finalize()` assembles `H` once
+(`fem/darcy/darcyhybridization.cpp:2333-2339`) and both `Mult()` and
+`GetGradient()` return it immediately
+(`fem/darcy/darcyhybridization.cpp:1757-1761`, `1779`). **The ordering is inert
+on a linear problem.**
+
+`Finalize()` also classifies the local problem into a `LocalOpType`
+(`fem/darcy/darcyhybridization.hpp:455-456`,
+`fem/darcy/darcyhybridization.cpp:2340-2374`): `PotNL` when only the potential
+is nonlinear (`A` is inverted up front), `FluxNL` when only the flux mass is
+(`D` is inverted up front), `FullNL` otherwise. §7 records a hole in the
+`FluxNL` case.
+
+---
+
+## 2. The reduced trace operator — condense first, linearise second
+
+The unknown handed to the outer solver is the trace alone, and the *reduced
+residual* is a genuinely nonlinear function of it: eliminating `u` and `p` on
+an element means solving that element's nonlinear equations.
+
+### One call to `Mult(x, y)`
+
+`DarcyHybridization::Mult` (`fem/darcy/darcyhybridization.cpp:1753-1772`)
+delegates to `MultNL(MultNlMode::Mult, darcy_rhs, x, y)` and then zeroes the
+essential trace rows. Per element, `MultNL`
+(`fem/darcy/darcyhybridization.cpp:1819-2214`):
+
+1. loads `bu_l`, `bp_l` from the stored right-hand side `darcy_rhs`, negating
+   `bp_l` when `bsym` (`:1896-1918`);
+2. gathers the element's trace block `x_l` face by face (`:1940-1946`);
+3. forms `bu_l − Cᵀ x_l` and `bp_l − E x_l` (`:1947-1968`);
+4. **runs a local nonlinear solve**: `MultInvNL(el, bu_l, bp_l, x_l, u_l, p_l)`
+   (`:2034`), starting from `darcy_u`/`darcy_p` if those were filled by the
+   essential-BC elimination, otherwise from zero (`:2004-2029`);
+5. accumulates the trace row `Cᵀᵀ u_l + G p_l + H x_l` plus any nonlinear face
+   contribution into `y` (`:2070-2196`).
+
+`MultInvNL` (`fem/darcy/darcyhybridization.cpp:2621-2785`) builds a
+`LocalNLOperator` (or `LocalFluxNLOperator` / `LocalPotNLOperator` depending on
+`lop_type`), builds an `LBFGSSolver`, `LBBSolver` or `NewtonSolver` per
+`SetLocalNLSolver()`, solves, and adds the iteration count to
+`num_local_nl_iters` (`:2764`). **This happens once per element per residual
+evaluation of the outer solver.** The local operator reads the *linear* form
+data `Af_lin_data` / `Df_lin_data`, not the Jacobian storage
+(`fem/darcy/darcyhybridization.cpp:4448`, `:4465`), which is why a residual
+evaluation is unaffected by whatever the last `GetGradient()` wrote.
+
+### One call to `GetGradient(x)`
+
+`GetGradient` (`fem/darcy/darcyhybridization.cpp:1775-1817`) allocates
+`D`/`E`/`G`/`H` if needed, runs `MultNL(MultNlMode::Grad, ...)` — which repeats
+steps 1–4 above (another local nonlinear solve) and then calls
+`ConstructGrad(el, faces, x_l, u_l, p_l)` (`:2055`) to assemble the local
+Jacobian at the converged local fields — and then `ComputeH(Gradient)` to
+factor `A`, form and factor the Schur complement, and assemble the reduced
+matrix (`fem/darcy/darcyhybridization.cpp:1485-1613`). Essential trace rows get
+a unit diagonal via `EliminateRow` (`:1802-1805`).
+
+So the reduced operator really is `F(λ)` with `F` a nonlinear function of the
+trace, and `GetGradient` really is `dF/dλ` — obtained by differentiating
+through the converged local solve.
+
+---
+
+## 3. NPC — Newton on the full system
+
+Not an ordering, and not reached through any mode setter: NPC's unknown is the
+whole `(q, u, λ)` vector rather than the trace, so it is a different
+`Operator`. One Newton step, per Nguyen, Peraire & Cockburn eqs (14)–(18):
+
+```
+assemble M and F_local at x_k          one factorisation per step
+S   = H - C' M⁻¹ B_λ
+rhs = -(F_λ - C' M⁻¹ F_local)          eq (18)
+solve S Δλ = rhs
+Δlocal = -M⁻¹ (F_local + B_λ Δλ)
+x_{k+1} = x_k + Δx                     all three blocks advance
+```
+
+**One local factorisation and one local linear solve per outer step, no local
+nonlinear iteration anywhere**, and the convergence test is on the full
+residual — which is the half a trace-only operator cannot express.
+
+### 3.1 The wrapper, which is what to use
+
+```cpp
+Array<int> offs(4);                    // {0, flux, potential, trace}
+offs[0] = 0;
+offs[1] = Vh.GetVSize();               // flux, L2 -> L-dofs are true dofs
+offs[2] = Wh.GetVSize();               // potential, likewise
+offs[3] = Mh.GetTrueVSize();           // trace: TRUE dofs, serial or parallel
+offs.PartialSum();
+
+BlockVector load(rhs, darcy.GetOffsets());   // (flux, potential) only
+DarcyNPCOperator npc(*darcy.GetHybridization(), offs, load);
+
+UMFPackSolver    trace;                // or CG/GMRES+AMG, or matrix-free
+DarcyNPCSolver   lin(trace);
+
+NewtonSolver newton;
+newton.SetOperator(npc);
+newton.SetSolver(lin);
+newton.Mult(zero, x);                  // x is the full (q, u, λ) vector
+```
+
+`npc.Height()` is `offs.Last()`; `x` and the residual are that long.
+`npc.LocalOffsets()` gives `{0, flux, potential}` for a caller splitting the
+local half back out.
+
+`DarcyNPCSolver` takes **any** `Solver` for the reduced trace system and
+re-points it at the new `S` on every Newton step. Nothing else is needed:
+`NewtonSolver` and `KINSolver` both drive this with no special support,
+because the fields are in `x` where every outer solver already keeps its
+state.
+
+**`KINSolver` wants `SetMaxSetupCalls(1)`.** KINSOL calls `LinSysSetup` every
+tenth step by default, which makes this a lagged-Jacobian Newton — legitimate,
+and self-consistent because the reduction and recovery eliminate with whatever
+factorisation is currently held, but it costs iterations: 12 against 4 on one
+case, both converged to round-off.
+
+**The line search is the caller's.** `NewtonSolver::ComputeScalingFactor` is
+virtual, and backtracking on the full residual is what NPC wants — well
+defined here precisely because the fields and the trace are one vector and
+scale together. A dozen-line subclass converges three stiff configurations
+that the deleted trace-only mode could not, in 13, 10 and 17 steps -- the
+first two counts on every arm of a perturbation sweep, the third only after
+the pedestal width moved off a convergence boundary; see the note under the
+line-search table below. Nothing
+about it is Darcy-specific, so it is not in the library;
+`miniapps/hdg/navierstokes.cpp` carries one behind `-ls` as a worked example.
+
+### 3.2 The four raw calls
+
+The wrapper is bookkeeping over these; use them directly to see the shape, or
+to drive an iteration `NewtonSolver` cannot express.
+
+```cpp
+void      NPCResidual(const BlockVector &b, const BlockVector &x,
+                      const Vector &x_tr, BlockVector &r, Vector &r_tr);
+Operator &NPCGradient(const BlockVector &x, const Vector &x_tr);
+void      NPCReduce  (const BlockVector &r, const Vector &r_tr, Vector &b_tr);
+void      NPCRecover (const BlockVector &r, const Vector &dtr, BlockVector &dx);
+```
+
+`b`, `x`, `r` and `dx` are two-block `(flux, potential)`; `x_tr`, `r_tr`,
+`b_tr` and `dtr` are trace vectors in **true dofs**. One step is
+
+```cpp
+dh.NPCResidual(b, x, x_tr, r, r_tr);        // F(q, u, λ)
+Operator &S = dh.NPCGradient(x, x_tr);      // assemble + factor J
+dh.NPCReduce(r, r_tr, b_tr);                // eq (18) right-hand side
+solver.Mult(b_tr, dtr);                     // your trace solve
+dh.NPCRecover(r, dtr, dx);
+x += dx;  x_tr += dtr;
+```
+
+**Call `NPCGradient()` before `NPCReduce()` and `NPCRecover()`** — both need
+the factored local blocks and the Schur complement it leaves behind, and both
+apply the Jacobian's `(0,1)` block rather than the linear one.
+
+`r`'s potential block carries the symmetrized sign convention when that is in
+force. Its norm is unaffected and nothing but the calls above should read it.
+
+### 3.2a Several right-hand sides against one Jacobian
+
+`NPCGradient()` factors the local blocks once and every application
+afterwards only reads them, so one handle may be applied any number of times.
+A bordered, deflated, parameter-continued or adjoint Newton has several
+right-hand sides known at the same moment, and applying `J⁻¹` to them one at
+a time walks the mesh, the face lookups and the factors once per column.
+
+The blocked forms take one column per right-hand side:
+
+```cpp
+void NPCReduce (const Array<const BlockVector *> &r,
+                const Array<const Vector *> &r_tr, Array<Vector *> &b_tr);
+void NPCRecover(const Array<const BlockVector *> &r,
+                const Array<const Vector *> &dtr, Array<BlockVector *> &dx);
+```
+
+and the whole step is one call on the wrapper:
+
+```cpp
+void DarcyNPCSolver::ArrayMult(const Array<const Vector *> &X,
+                               Array<Vector *> &Y) const;   // Operator's
+```
+
+`ArrayMult()` is `Operator`'s own multi-right-hand-side interface, not
+something this class invented, so a bordered solve written against it is not
+tied to hybridized Darcy. It composes the three legs blocked: one pass over
+the mesh to reduce, **one call to the trace solver's `ArrayMult()`**, one pass
+back to recover. A trace solver that overrides `ArrayMult()` — `MUMPSSolver`,
+`SuperLUSolver`, `STRUMPACKSolver`, `CuDSSSolver`, `PardisoSolver` — then
+walks its factors once too; `Operator::ArrayMult()`'s base implementation is
+a loop over `Mult()`, so any other solver still works and saves nothing in
+that leg.
+
+Three things to know before reaching for it.
+
+* **Every column must belong to the same `NPCGradient()` call.** There is no
+  check for this and there cannot be: the factors are the hybridization's
+  state, not the argument's.
+* **The arithmetic on any one column is unchanged.** Each local solve becomes
+  one `LUFactors::Solve()` over all the columns and each face product becomes
+  a matrix-matrix one, so what is saved is the traversal and the memory
+  traffic, not flops. Expect the answers to match the single-vector route to
+  round-off and no better.
+* **This is a different axis from `LocalFactorMode::Batched`**, which blocks
+  the same local solve over *elements* at one column. The two do not compose
+  and the blocked legs take no notice of it. A caller with one right-hand
+  side should stay where it is.
+
+`X.Size() == 1` forwards to `Mult()` and allocates nothing, so nothing about
+the single-right-hand-side path changes.
+
+### 3.2b A correction to one element's local Jacobian
+
+```cpp
+void DarcyHybridization::AddNextGradientCorrection(int el, const DenseMatrix &dD);
+```
+
+This adds `dD` to element `el`'s potential-potential block, after the block
+is assembled and before it is factored, for the **next `NPCGradient()`
+only**. It works on the element loop and on the caller-integrand batched
+route alike, and through `DarcyNPCOperator::GetGradient()`. `NPCReduce()` and
+`NPCRecover()` then use the corrected factors. `dD` means what the same
+matrix added to the potential mass integrator's `AssembleElementGrad()`
+elmat would mean.
+
+The queue empties on every `NPCGradient()`, so queue again each step. With
+nothing queued the gradient is unchanged to the bit. It is refused under
+`LocalOpType::FluxNL`, where the potential block is not reassembled.
+Element numbers are rank-local.
+
+### 3.3 The gradient, and not assembling it
+
+`NPCGradient()` honours `SetGradientMode()`:
+
+| | `S` is | trace solver |
+|---|---|---|
+| `Assembled` (default) | `SparseMatrix`, or `HypreParMatrix` in parallel | anything, including direct and AMG |
+| `MatrixFree` | an `Operator` applying `S = H - C'M⁻¹[C;E]` element by element, **no global matrix** | a Krylov method needing only the action |
+
+Both factor the local blocks and form the local Schur complement, so the
+reduction and the recovery are identical either way; only the *global* trace
+matrix is declined. The two agree at every iterate above round-off.
+
+**The returned handle is solve-only and its `Mult()` aborts.** After
+`ComputeH()` the local arrays hold the *factored* blocks, so `J` cannot be
+applied out of them without unfactored copies of every block.
+`DarcyNPCSolver::SetOperator` dynamic-casts for it, so a plain Krylov method
+over `GetGradient()` fails loudly rather than silently — and **JFNK is
+therefore unavailable**, since it needs exactly that action.
+
+**A gradient-free outer solve is a different case and the answer is
+measured, not inferred.** `LBFGSSolver` and `LBBSolver` never call
+`GetGradient()` — they read `oper->Mult` only — so nothing stops a caller
+handing them `DarcyNPCOperator`; `DarcyNPCSolver` is then simply unused and
+the hybridized elimination never runs. Tried on a case `NewtonSolver` solves
+in four steps, LBFGS **diverges to NaN**. Whether that is L-BFGS wanting a
+gradient field the full residual does not provide, or a scaling between the
+local and trace rows, has not been established. Either way it is not a route
+to recommend.
+
+### 3.4 Parallel
+
+Supported, and the same calls. The flux and potential are L2, hence rank-local
+with L-dofs equal to true dofs and **no communication at all**; the trace lives
+on the skeleton and is the only thing shared, so it is prolonged on the way in
+and assembled on the way out. Size the trace block with `GetTrueVSize()` as
+above and everything else follows.
+
+Pinned by `[NPC][Parallel]` in `tests/unit/fem/test_darcy_npc.cpp`, the first
+`[Parallel]` Darcy case in this tree: on a problem whose full system is linear
+one NPC step is exact on two ranks, to below 1e-13. That is the sharp check —
+get any one of the four prolongation or assembly steps wrong and the second
+residual is O(1), not 1e-10.
+
+### 3.5 What it refuses, and what is missing
+
+One hard refusal, a `MFEM_VERIFY` in `NPCCheck()`: **a conforming H(div) flux
+space** — and it is now a measured refusal rather than a precautionary one.
+The reason is representational, not the sign conventions this entry used to
+name: NPC iterates on the *broken* state, a conforming space is one dof per
+interior face too small to hold it, so both elements read the same value and
+the trace row cancels identically. The measurement, the numbers and the way
+around it are on `NPCCheck()` and in the `@note` on the `NPCResidual` group;
+`doc/HDG-HDIV-OPTIONAL.md` §1 says what is left.
+
+**`BrokenRT_FECollection` is the H(div)-shaped space NPC does take**, already
+admitted and now covered by "An H(div) element reaches NPC through a broken
+space" in `tests/unit/fem/test_darcy_npc.cpp`.
+
+`LocalOpType::FluxNL` was refused here too and no longer is. The Schur
+complement had nowhere to live in that mode — `Df_data` holds the factored
+*linear* potential mass, which the local solve needs — so `ComputeElementH()`
+built it in a temporary and dropped it. It now goes to `Sf_data`; see §7.3 for
+the withdrawal of what that entry claimed.
+
+Missing rather than refused — **and two of the three entries that stood here
+were stale, both overtaken by work that had already been done**:
+
+* ~~The trace right-hand side has no slot~~ — **built, and this entry told a
+  caller to work around something that exists.** `DarcyForm::GetTraceRHS()`
+  (`fem/darcy/darcyform.hpp:501`) is the third load beside `GetFluxRHS()` and
+  `GetPotentialRHS()`, and **both routes carry it with no caller wiring**:
+  `ReduceRHS()` adds `P^T b_λ` to the reduced right-hand side and
+  `NPCResidual()` subtracts it from the trace block, which is the same
+  convention read off `r = A x - b`. The sign, the API and why the
+  registration happens at construction rather than at `Assemble()` are on the
+  accessor; the pin is "A load on the skeleton reaches both routes" in
+  `tests/unit/fem/test_darcy_npc.cpp`. The entry's own reasoning — that a real
+  slot "would move the reduced route too, and nobody has asked" — was right
+  about the first half and is why the slot serves both;
+* ~~No NPC regression reference exists~~ — **there are 23 serial and 23
+  parallel `*_npc.txt`.** No suite total here on purpose: 23 is a property of
+  NPC, the total is a property of the branch, and the total this used to carry
+  was overtaken twice;
+* ~~`ComputeSolution()` has not been exercised~~ — "ComputeSolution reproduces
+  the fields NPC already holds" does exactly that.
+
+## 4. Sizes
+
+Notation, all read off the code rather than assumed:
+
+| symbol | meaning | source |
+|---|---|---|
+| `NE` | elements | `fes.GetNE()` |
+| `NF` | faces (`Mesh::GetNumFaces()`) | `cpp:1140` |
+| `N_u` | flux L-dofs, `fes.GetVSize()` | `cpp:3092` |
+| `N_p` | potential L-dofs, `fes_p.GetVSize()` | `cpp:3093` |
+| `N_λ` | trace L-dofs, `c_fes.GetVSize()` | `fem/hybridization.cpp:33` |
+| `a_e` | **free** flux dofs of element `e` | `Af_f_offsets[e+1]-Af_f_offsets[e]`, `cpp:189-202` |
+| `h_e` | *all* flux vdofs of element `e` | `hat_offsets[e+1]-hat_offsets[e]`, `cpp:120-131` |
+| `d_e` | potential dofs, `fes_p.GetFE(e)->GetDof() * fes_p.GetVDim()` | `cpp:228` |
+| `c_f` | trace dofs of face `f`, `c_fes.GetFaceElement(f)->GetDof() * c_fes.GetVDim()` | `cpp:1009` |
+
+`a_e = h_e` unless flux dofs were declared essential in `Init()`; the
+difference `e_e = h_e − a_e` is what the eliminated blocks carry.
+
+### 4.1 Global
+
+| object | size | where |
+|---|---|---|
+| monolithic mixed system | `(N_u + N_p) × (N_u + N_p)` | never assembled by this class |
+| reduced (trace) system `H` | `N_λ × N_λ`, sparse | `ComputeH()`, `cpp:1502` |
+| `Operator::Height()` of `DarcyHybridization` | `N_λ` | `fem/hybridization.cpp:33` |
+| `Operator::Height()` of `ParOperator` | `c_fes.GetTrueVSize()` | `hpp:434` |
+| reduced RHS `b_r` | conforming/true trace size | `ReduceRHS()`, `cpp:3469-3494` |
+
+Hybridization pays off when `N_λ < N_u + N_p`, which is the usual HDG
+situation: `N_λ` counts trace dofs on `NF` faces while `N_u + N_p` counts
+`neq·(dim+1)` volume fields. The class does not check this, and the base-class
+doxygen says as much (`fem/hybridization.hpp:47-49`).
+
+### 4.2 Per element and per face
+
+Flat arrays, all `Array<real_t>`, indexed by prefix-sum offset arrays. Note
+that `Bnl_data` is indexed by `Bf_offsets` but read in the **transposed**
+orientation (`fem/darcy/darcyhybridization.hpp:329-331`), and that `G_data`
+shares `E_data`'s offsets by reference (`hpp:356`).
+
+| data | offsets | block shape | count | note |
+|---|---|---|---|---|
+| `Af_data` | `Af_offsets` | `a_e × a_e` | `Σ a_e²` | `Mu` block, overwritten by the Jacobian's (0,0) and then LU-factored in place |
+| `Af_ipiv` | `Af_f_offsets` | `a_e` | `Σ a_e` | pivots |
+| `Af_lin_data` | `Af_offsets` | `a_e × a_e` | `Σ a_e²` | backup of the **linear** flux mass |
+| `Ae_data` | `Ae_offsets` | `e_e × h_e` | `Σ e_e·h_e` | eliminated flux rows |
+| `Bf_data` | `Bf_offsets` | `d_e × a_e` | `Σ a_e·d_e` | the linear divergence form |
+| `Bnl_data` | `Bf_offsets` | `a_e × d_e` | `Σ a_e·d_e` | `d(flux residual)/dp`; empty unless a flux law depends on `p` |
+| `Be_data` | `Be_offsets` | `e_e × d_e` | `Σ e_e·d_e` | eliminated divergence rows |
+| `Df_data` | `Df_offsets` | `d_e × d_e` | `Σ d_e²` | `D`, then the **Schur complement**, LU-factored in place |
+| `Df_ipiv` | `Df_f_offsets` | `d_e` | `Σ d_e` | pivots |
+| `Df_lin_data` | `Df_offsets` | `d_e × d_e` | `Σ d_e²` | backup of the **linear** potential mass |
+| `Ct_data` | `Ct_offsets` | `a_{el1} × c_f` and `a_{el2} × c_f` | `Σ_f c_f(a_{el1}+a_{el2})` | `GetCtFaceMatrix(f, side, ·)`, `cpp:1647-1667` |
+| `E_data` | `E_offsets` | `d_{el} × c_f` per side | `Σ_f c_f(d_{el1}+d_{el2})` | `cpp:1669-1688` |
+| `G_data` | `E_offsets` (alias) | `c_f × d_{el}` per side | same | `cpp:1690-1709` |
+| `H_data` | `H_offsets` | `c_f × c_f` | `Σ_f c_f²` | face-diagonal only; `cpp:1711-1716` |
+
+The local Jacobian `M` of §3 is therefore never a separate object: it is
+`Af_data` (0,0), `Bf_data` (1,0), `±Bf_dataᵀ + Bnl_data` (0,1) and `Df_data`
+(1,1), the last two folded into the Schur complement by `ComputeElementH()`
+(`fem/darcy/darcyhybridization.cpp:1292-1356`). Its per-element size is
+`(a_e + d_e)²` conceptually and `a_e² + a_e d_e + d_e²` in storage.
+
+An element's block of the reduced matrix is `T_e × T_e` with
+`T_e = Σ_{f ∈ ∂e} c_f` (`GetElementTraceSize()`, `cpp:1265-1273`); in
+`AssemblyMode::Threaded` a chunk of those blocks is buffered before the serial
+scatter (`cpp:1531-1572`).
+
+### 4.3 What NPC adds
+
+Nothing per element. NPC reuses the same blocks — it assembles the Jacobian
+into `Af_data`/`Bf_data`/`Bnl_data`/`Df_data` exactly as a gradient pass does,
+and `ComputeH()` factors them exactly as it does for the reduced operator. The
+retained-linearisation storage that the deleted mode carried (`lin_trace`,
+`lin_u`, `lin_p` and their `_next` scratch, five vectors and a validity flag)
+went with it.
+
+What NPC adds is on the **caller's** side: the unknown is `n_flux + n_pot +
+n_trace` rather than `n_trace`, and the caller holds the residual and the
+increment at that size. That is the whole cost of making the fields Newton
+state.
+
+## 5. What changes from standard MFEM assumptions
+
+### 5.1 and 5.2 are gone with the mode they were about
+
+They asked whether `Mult` is a function of its argument, and what contract a
+solver had to honour. Both were properties of the deleted trace-only mode,
+which retained a linearisation between calls. The reduced operator solves
+its local problem afresh every evaluation and NPC holds no state between
+calls at all, so for both of them `Mult` is a function of its argument and
+there is no contract to state.
+
+The finding worth keeping out of them is not about either mode:
+
+**A better Jacobian can converge to a different solution.** Where a coarse
+discretisation carries more than one, an iteration driven by an inaccurate
+gradient wanders and can settle on the branch a Picard iteration finds; with
+the gradient right it converges faster and stays on its own. A caller had a
+test pinning Newton against Anderson-Picard on one mesh at 1e-6, and after a
+gradient fix it read 9.1e-05 — bit identical when the tolerance was tightened
+four orders, so both were fully converged and the fixed points genuinely
+differed, at 1e-13 on two other meshes and 3e-06 on a third with no trend.
+That is a gate that was green for the wrong reason, not a regression. It is in
+`DarcyHybridization`'s doxygen too.
+
+### 5.3 Consequences for solvers
+
+Both routes work with every outer solver MFEM offers, and neither places a
+requirement on one. The table that stood here was mostly a list of what the
+deleted mode broke.
+
+| solver | reduced trace operator | NPC (full system) |
+|---|---|---|
+| `NewtonSolver` | works | works, and needs to know nothing |
+| Newton + line search | works | works, and the search scales the fields with the trace |
+| lagged Jacobian | works | works |
+| `LBFGSSolver`, `LBBSolver` | works | accepted but **diverges to NaN** where Newton takes four steps; they never ask for a gradient, so the elimination goes unused. See §3.3 |
+| `KINSolver`, matrix-based | works | works; **use `SetMaxSetupCalls(1)`** or KINSOL's lazy `LinSysSetup` gives a lagged-Jacobian Newton (12 iterations against 4, both converged) |
+| JFNK / matrix-free outer solve | works | **unavailable** — it needs the Jacobian's action and the handle is solve-only |
+
+`SetLocalNLSolver()` configures the local nonlinear solve that
+the reduced operator runs per element. **NPC has no local nonlinear solve**,
+so it is inert there, and `GetNumLocalNLIterations()` staying at zero is the
+acceptance signal that NPC is doing what it claims: one local *linear* solve
+per outer step.
+
+### 5.4 `MultInv(..., with_bnl)` and the gradient modes
+
+`MultInv()` applies `M⁻¹` with the stored factors
+(`fem/darcy/darcyhybridization.cpp:3106-3161`). Its `with_bnl` argument decides
+whether the (0,1) block is the Jacobian's — `∓Bᵀ` **plus** `Bnl_data` — or the
+linear `∓Bᵀ` alone (`fem/darcy/darcyhybridization.hpp:664-672`). The Schur
+complement in `Df_data` must have been built the same way, which is what
+`ComputeH(ComputeHMode::Gradient)` does
+(`fem/darcy/darcyhybridization.cpp:1319-1327`).
+
+Current callers:
+
+| call site | `with_bnl` |
+|---|---|
+| `MultNL(GradMult)` — the matrix-free gradient application, `cpp:2067` | `true` |
+| `NPCReduce` and `NPCRecover` | `true` — they eliminate with the *Jacobian*, so its (0,1) block is the one that belongs |
+| `ReduceRHS` (linear path), `cpp:3562` | default `false` — correct, `Bnl` is empty |
+| `ComputeSolution` (linear path), `cpp:3772` | default `false` — same |
+
+**`MFEM_DARCY_HYBRIDIZATION_GRAD_MAT` no longer exists.** It was unconditionally
+defined, so its non-default path was never built; commit `c849adffd5` deleted
+it in favour of a run-time choice,
+`SetGradientMode(GradientMode::Assembled | MatrixFree)`, defaulting to
+`Assembled` (`fem/darcy/darcyhybridization.hpp:228-251`, `:823-837`). That
+commit also closed the gap the plan document still describes:
+`ConstructGrad()` used to carry its own factorisation, reached only when the
+macro was off, built from the linear `∓Bᵀ` alone — so the two modes were
+different operators whenever the flux law depended on the potential. It is
+deleted (`fem/darcy/darcyhybridization.cpp:3322-3328`) and both modes now take
+`ComputeH()`'s first half. **So the gap is closed** — the tests sweep `GradientMode` over the reduced
+operator and over NPC alike (`tests/unit/fem/test_darcy_npc.cpp`).
+
+What `MatrixFree` costs, in exchange: `GetGradient()` returns an `Operator`
+with no matrix, so `GSSmoother`, `UMFPackSolver` and the algebraic
+preconditioners abort (`fem/darcy/darcyhybridization.hpp:827-831`). It used to
+be **refused for `LocalOpType::FluxNL`**, for the storage reason above; since
+`Sf_data` exists it works in every mode. And two things the assembled
+matrix gets for free have to be applied by hand: the unit row on essential
+trace dofs, and `SetDiagIdentity()`'s regularisation of rows nothing
+contributed to (`fem/darcy/darcyhybridization.cpp:4180-4205`, and
+`MarkEmptyTraceRows()` at `:2787-2851`). Without the latter the two modes
+differed by **0.497 on 64 of 160 trace rows** on a problem whose constraint has
+no boundary face term (commit `c849adffd5`); the case is
+`tests/unit/fem/test_darcy_linearise_first.cpp:761-798`.
+
+### 5.5 Other places the default expectation is wrong
+
+These apply to the nonlinear hybridized operator generally.
+
+1. **The reduced right-hand side is zero, and the load lives inside the
+   operator.** For a nonlinear problem `ReduceRHS()` stores the mixed RHS in
+   `darcy_rhs` and returns a zeroed `b_r`
+   (`fem/darcy/darcyhybridization.cpp:3445-3495`); `Mult()` returns the full
+   residual, load included. `NewtonSolver::Mult(B, X)` then subtracts a zero
+   `B`. `EliminateTraceTrueDofsInRHS()` for the nonlinear case only zeroes the
+   essential rows (`fem/darcy/darcyhybridization.cpp:2587-2599`). A caller
+   reasoning "`A x = b` with the `b` I was handed" will be surprised.
+2. **`Mult()` is `const` and mutates a great deal** — the local block
+   storage above all. It is `const` because `Operator` requires it, not
+   because it is free of side effects.
+3. **`GetGradient()` overwrites the local block storage.** After it,
+   `Af_data`/`Df_data` hold the last Jacobian and its Schur complement, not the
+   forms. For the reduced operator this is invisible, because the residual
+   reads `Af_lin_data`/`Df_lin_data`. Under NPC it is why the Jacobian handle
+   is solve-only: there is nothing left to apply `J` out of.
+4. **The returned gradient does not outlive the next call.** `Assembled` resets
+   `Grad` each time (`cpp:1793`); `MatrixFree` returns a `Gradient` that reads
+   whatever is currently in `Af_data`/`Df_data`, so holding a reference across
+   a later `GetGradient()` silently applies the *new* operator.
+5. **Essential trace dofs are carried the `NonlinearForm` way, not the
+   `BilinearForm` way**: the values ride in `x`, the residual is zeroed on those
+   rows, the Jacobian gets a unit row, and only rows (not columns) are
+   eliminated (`fem/darcy/darcyhybridization.cpp:1766-1772`, `:1802-1805`).
+   Any finite-difference check of the gradient must mask them or it is
+   meaningless — the accessor `GetEssentialTrueDofs()` exists for exactly that
+   and says so (`fem/darcy/darcyhybridization.hpp:1098-1104`).
+6. ~~**`ComputeSolution()` has not been exercised against an NPC
+   solution.**~~ — **stale, and §3.5 on this same page had already struck
+   it.** "ComputeSolution reproduces the fields NPC already holds" in
+   `tests/unit/fem/test_darcy_npc.cpp` does exactly that. The standing
+   observation survives and is not a defect: under NPC the fields are
+   already Newton state, so the back-substitution is redundant rather than
+   wrong.
+
+7. **Moot.** It described `SetNonlinearOrdering()`'s cache invalidation, and
+   both the method and the cache are deleted.
+
+---
+
+## 6. When to use which
+
+They are different methods reaching the same discrete solution, so the choice
+is about cost and robustness rather than correctness. Tests assert that both
+get there.
+
+**Which to reach for depends on one thing: what the element-local nonlinear
+solve costs on your problem.** That is the whole of it, and an earlier version
+of this section gave "reach for the reduced trace operator unless you have a
+reason not to" as a general default. That was wrong as a default and `meq`
+measured it so — see `HDG-NPC-GLOBALISATION-FROM-MEQ.md`.
+
+**The reduced trace operator.** The outer unknown is the trace alone, much the
+smaller vector, and the local problem is solved to a tolerance you control. Of the two
+**nonlinear** routes it is the only one that accepts an **H(div) flux** — NPC
+refuses it and potential reduction refuses nonlinear integrators. Read as an
+absolute statement it would be wrong: potential reduction and the unreduced
+monolithic solve both take an H(div) flux for a *linear* problem, and
+`tests/unit/fem/test_darcy_reduction.cpp` runs both. Reach for it when the local
+problems are mild — then the per-element Newton is cheap and solving it
+properly is worth more than avoiding it.
+
+**NPC** when the per-element nonlinear solves are the cost or the thing that
+fails. Every local operation is one linear solve against one factorisation, so
+a stiff local problem cannot stall the outer iteration the way it can under
+condensation; the price is that the unknown is the whole system and the
+convergence test with it.
+
+**And it is often faster, which this section used to deny.** It said NPC's
+advantage was uniformity of the local work "not fewer floating-point
+operations". On a semilinear Grad-Shafranov discretisation `meq` measured 4.3x
+and 3.7x of wall clock at the same or fewer iterations, and a whole test suite
+at 872 s -> 499 s, because the element-local Newton the condensation runs per
+element per residual evaluation *is* most of the cost and NPC deletes it. When
+NPC fails it also fails 33x to 41x cheaper, having run no local nonlinear
+iterations at all — which makes it the better thing to try first even on
+problems it loses. The uniformity claim stands; the "not fewer operations"
+half is withdrawn.
+
+### The line search: read this before taking the recommendation
+
+Measured here on the Darcy pedestal, undamped against backtracking on the full
+residual, at the four configurations §7 used to cite:
+
+| | undamped | with backtracking |
+|---|---|---|
+| n=8 k=2 | fails, 2.4e+00 | **ok, 13 steps** |
+| n=12 k=3 | ok, 12 steps | ok, 10 steps |
+| n=32 k=1 | fails, 4.9e-01 | **ok, 17 steps** |
+| n=24 k=1 | fails, 1.4e+00 | fails, 2.9e-03 |
+
+**Two of those backtracking counts are properties of the method and one was a
+draw, and the table cannot tell you which.** Perturbing the initial trace by
+1e-13 -- fifteen orders below the state -- and crossing that with
+`MKL_NUM_THREADS` in {1,2,4,8} gives 13 steps on every arm for n=8 k=2 and 10
+on every arm for n=12 k=3. The n=32 k=1 row, at the pedestal width 0.003 these
+were taken with, gives 18, 22, 25, 28 or 40: it sits on this method's
+convergence boundary, where width <= 0.0025 stalls on every arm and
+width >= 0.004 converges in five or six on every arm. At 0.0032 it is 17 on all
+sixteen arms, which is the width the unit cases now pin and the source of the
+17 quoted above.
+
+It is not a defect in the operator, and the check that settles that is cheap:
+normalise the step to unit length and finite-difference `NPCResidual` along it.
+The elimination's claim `J.delta = -r` holds to six to eight digits at every
+healthy iterate -- so the gradient is right -- and the same measurement shows
+`|J d|` falling to 1.3e-09 at `|d| = 1`. The Jacobian is going singular along
+the direction Newton is heading in; the problem has several roots, and the
+iterate is approaching a fold between them. Condensation reaches a root there
+in 7 to 9 steps and `NPCResidual` sees that root at 1.8e-12.
+
+A step-norm cap looks like the answer and is not: bounding `|dx|` at 10
+converges in 15 steps on all twelve arms of the perturbation sweep, but
+sweeping the cap shows 10 works while 15 and 30 do not, and any cap breaks the
+two configurations that converge without one. Near a fold the cap only changes
+which trajectory round-off picks.
+
+**The operational half, for anyone reading a red suite:** a configuration on
+that boundary fails only when something pins the BLAS thread count, because
+UMFPack's reduction order is where the round-off enters. Three unit cases on it
+were green for months and failed the first time a run set
+`MKL_NUM_THREADS=1`, with no library change behind them.
+
+So on *this* problem the line search earns its place, and the baseline is
+plain undamped `NewtonSolver` on NPC — not the deleted mode, which is what
+`meq` asked. **On `meq`'s problem the same line search made every case worse**,
+including five that converge undamped.
+
+Both are true and the block structure is not what separates them, because it
+is the same. Measured here: the flux row falls to 4e-17 and the trace row to
+3e-14 on a full step, with the entire remainder in the potential row — exactly
+the shape `meq` reports. **What differs is severity.** Here a full step
+*reduces* the potential residual (4.7e-01 -> 1.7e-01); on `meq`'s problem it
+multiplies it by 77 (8.1e-02 -> 6.25e+00), so `alpha = 1` is rejected and the
+search retreats.
+
+**There was a hand-rolled backtracking Newton here, and it is deleted.**
+`NSBacktrackingNewton` in `miniapps/hdg/navierstokes.cpp` reimplemented a worse
+version of `KINSolver(KIN_LINESEARCH)` — KINSOL's Dennis & Schnabel search,
+with both the sufficient-decrease and curvature conditions, a minimum-step test
+that reports non-convergence instead of creeping, and a maximum-step
+constraint. It existed only because neither HDG tree was then configured with
+SUNDIALS, so `KINSolver` was not compiled; **both trees carry
+`MFEM_USE_SUNDIALS=YES` now, and the miniapp `#error`s without it**, so the
+build reason is gone along with the class. Globalisation there comes from
+KINSOL.
+
+Why it was worth deleting rather than keeping: it accepted on `Norm(rt) < n0`,
+a monotone test with **no sufficient-decrease constant**. For Newton on an l2
+merit the direction is always a descent direction, so merit(a) ~ merit(0)(1-a)
+and any small enough `a` passes — swept, `a = 1.2e-4` still "succeeded",
+improving the merit by 1e-4 relative. Where `a = 1` is rejected it therefore
+did not fail, it **crept**, which is the 1%-a-step crawl `meq` saw. A
+reference implementation other people copy should not have that in it.
+
+**But that defect is not what makes `meq`'s problem fail, and an earlier
+version of this section implied it was.** `meq` also ran `KIN_LINESEARCH` —
+the correct implementation, sufficient decrease and all — and reports it
+failing on exactly the same cases. So a proper Armijo test does not rescue it:
+deleting ours made the failure honest, not convergent.
+
+**Nor does a block-aware merit, which is what both we and `meq` reached for
+next.** Take `meq`'s own numbers: the residual at `x` is (flux 7.93e-02,
+potential 8.13e-02, trace 0) and after a full step (1.14e-16, 6.25e+00,
+1.82e-13). For any diagonal merit with weights `(w_f, w_p, w_t)`, accepting
+`a = 1` needs
+
+    (w_p * 6.25)^2  <  (w_f * 0.0793)^2 + (w_p * 0.0813)^2   =>   w_f/w_p > 78.8
+
+— you would have to weight the **linear flux row 79x above the nonlinear
+potential row**, the opposite of damping the nonlinear block. And a merit that
+all but ignores the potential row is one a Newton step annihilates exactly, so
+the search accepts `a = 1` unconditionally and degenerates into no line search.
+KINSOL already exposes exactly this knob (`KINSolver::Mult(x, x_scale,
+fx_scale)`), so the idea is cheap to test and the arithmetic says not to
+bother.
+
+**What the evidence actually points at is non-monotonicity.** Undamped Newton
+converges five cases that every monotone search kills, which is the signature
+of an iteration that must be allowed uphill to reach the basin. The remedies
+are a non-monotone acceptance test (accept below the max of the last M
+merits), a trust region, or no line search — and KINSOL's own answer,
+Anderson-accelerated `KIN_PICARD`/`KIN_FP` (`KINSolver::EnableAndersonAcc()`),
+is precisely the production ladder `meq` already ships. None of that needs a
+new solver written here.
+
+## 7. Suspected defects and inconsistencies
+
+**Nine of the eleven entries that stood here are gone**, and their write-ups
+went into the code rather than into this file. Items 1, 2, 4, 5, 6 and 7 were
+about `NLOrdering::LineariseThenCondense` and are moot with the mode; what
+replaced item 7 in §6 is runnable as "The line search earns its place on the
+pedestal, and says which" in `tests/unit/fem/test_darcy_npc.cpp`. Item 8 is
+fixed — `GetFluxMassNonlinearIntegrator()` returned the *potential* integrator
+in two headers and returns `m_nlfi_u` now, latent because nothing called
+either accessor. Item 9 is moot with the mode's members. **Item 3 is fixed**
+and the reason lives on `Sf_data`, `SetGradientMode()` and `NPCCheck()`.
+
+Item 3 left one lesson worth carrying, because it is about how the other ten
+were written: it claimed `LocalOpType::FluxNL` would let the assembled path
+eliminate with the wrong operator and return a silent wrong answer. It could
+not — the only readers of a Schur complement out of `Df_data` were themselves
+refused in that mode, so the hazard was real in structure and unreachable in
+practice, held shut by the very refusals the entry complained about. The real
+defect was narrower: the Schur complement had nowhere to live, so two
+capabilities were refused rather than one answer corrupted. **"X is unguarded"
+is two claims — that the guard is missing, and that something reaches the gap
+— and the second is the one nobody checks.** These eleven were found by
+reading rather than by running, which is why they needed this treatment at all.
+
+**Item 11 is fixed.** `ParOperator::GetGradient()` passed an empty dummy
+`Vector y` to `ParMultNL()`, which aliased a `c_fes.GetVSize()`-long view onto
+it. The wrapper now branches on `Grad`/`GradAtFields` before reaching that
+`MakeRef` and leaves `y` empty deliberately, which it has to, because
+`GetGradient()` and `ReducedGradient()` both reach it now. The sibling defect
+that came with the routing — `GradMult` dereferencing a default-constructed
+`darcy_rhs` — is `93c3687b84` and is on the trunk.
+
+**Item 10 is fixed too, and nothing in §7 is open any more.** Three of its
+four sites were closed by the routing lift: `Mult()`, `GetGradient()` and
+`ReducedGradient()` all go through `ParMultNL()`, which prolongs, and
+`MultNL()` opens with `MFEM_VERIFY(x.Size() == c_fes.GetVSize())` so the
+convention cannot be skipped again. The fourth was the operator's own
+advertised size, which `Hybridization`'s constructor sets to
+`c_fes.GetVSize()` while every entry point works in TRUE dofs;
+`Finalize()` now announces `tr_cP->Width()` when a trace prolongation
+exists, which is `ReduceRHS()`'s expression written the same way, and
+`Mult()` checks both its arguments against it. **That fourth site is on the
+trunk**, `e81b711dae`, and merged out to all four descendants, the three
+routines it touches predating every one of them.
+
+**The entry's own scope note was wrong and that is the part worth keeping.**
+It said the disagreement was reachable only with an `H1_Trace` (EDG) space.
+`DG_Interface_FECollection` derives from `RT_FECollection` and reports
+`GetContType() == NORMAL`, so `BuildConformingInterpolation()` does not take
+its early exit and a plain DG trace on a NONCONFORMING mesh has a real
+prolongation -- measured on `data/amr-quad.mesh` with one refinement, `cP`
+non-null at every order, VSize/TrueVSize 528/464 at order 1 and 1056/928 at
+order 3.
+
+It was a read past the end rather than a wrong answer, which is why it
+survived: `NewtonSolver` sizes its correction from `Width()` and GMRES sizes
+its Krylov vectors from the assembled gradient, so `Update()` ran off them --
+**512 invalid reads under valgrind**, against **0** on three control arms
+that all print the same answer to six digits (the same mesh linear, the same
+mesh under `-npc`, and the same nonlinear problem on a conforming mesh). The
+pin is "The reduced trace operator is sized in the trace's TRUE dofs" in
+`tests/unit/fem/test_darcy_nonlinear.cpp`; it asserts SIZES, because a defect
+that cannot move an answer cannot be caught by comparing answers.
+
+Nothing in either reference set covered the combination when this was
+written -- grouping the `_nc_` references by their options, every nonlinear
+one was NOT hybridized and every hybridized one was linear.
+`p6_o2_dg_nc_hb_nl_newton.txt` closed that, and closing it is what the entry
+below is about.
+
+**One thing it uncovered was chased and is now BUILT.** A nonconforming
+master face has no second element and no boundary attribute, and every
+element-major face loop called that a boundary face; `GetBdrAttribute(-1)`
+did the rest. Those loops now test for a master first and expand it onto its
+slave sub-faces, evaluating the integrator per slave and carrying the trace
+row back with `I^T` -- the same transfer the linear route uses, from the same
+`GetNCSlaveTransfer()`. The one-sided repair that looks cheapest was built
+and measured wrong by six percent; see `DarcyHybridization::Finalize()` for
+that attribution, and roadmap §13 for what is still open (a partition
+cutting a hanging node, and the batched pair kernels, both refused by
+name).

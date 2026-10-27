@@ -1,0 +1,1024 @@
+// Copyright (c) 2010-2025, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#ifndef MFEM_DARCYFORM
+#define MFEM_DARCYFORM
+
+#include "../../config/config.hpp"
+#include "../bilinearform.hpp"
+#include "../nonlinearform.hpp"
+#include "darcyreduction.hpp"
+#include "darcyhybridization.hpp"
+
+namespace mfem
+{
+
+/// Block bilinear form for Darcy-like mixed systems
+/** Class DarcyForm represents mixed systems with (anti)symmetric weak form
+    common for parabolic and elliptic problems. They can be written as:
+    \verbatim
+        ┌        ┐┌   ┐   ┌    ┐
+        | Mu ±Bᵀ || u | _ | bu |
+        | B  Mp  || p | ̅  | bp |
+        └        ┘└   ┘   └    ┘
+    \endverbatim
+    where @a u is the flux (continuous or discontinuous) and @a p is the
+    potential (assumed always discontinuous). The bilinear forms @a Mu
+    and @a Mp are the mass terms of the flux and potential respectively. The
+    mixed bilinear form @a B is the divergence of flux (in a generalized sense)
+    and @a bu and @a bp are the right-hand-side terms of the flux and potential
+    respectively. The r.h.s terms can be constructed internally or
+    provided externally (see FormLinearSystem()).
+
+    The sign convention of the system is chosen in the constructor DarcyForm().
+    Given the set of the forms (Mu, B, Mp), either a symmetric system without
+    a sign change (#bsym == false) or with a flipped sign (#bsym == true) is
+    formed respectively:
+    \verbatim
+        ┌       ┐        ┌        ┐
+        | Mu Bᵀ |        | Mu -Bᵀ |
+        | B  Mp |   or   | -B -Mp |
+        └       ┘        └        ┘
+    \endverbatim
+
+    The individual terms of the system are accessed through Get*Form() or
+    Get*RHS() methods, where the non-const versions construct the corresponding
+    forms at the first occurence. After setting up the (bi)linear forms, the
+    system is assembled through Assemble() and finalized by Finalize(),
+    similarly to BilinearForm. Furthermore, the elimination of the essential
+    TDOFs and construction of the discrete linear system is done through
+    FormLinearSystem() followed by RecoverFEMSolution(). Note the primary
+    variables and the r.h.s terms are packed together in BlockVector%s
+    (with offsets obtained through GetOffsets()).
+
+    A notable feature of DarcyForm is the capability to perform algebraic
+    reduction or hybridization of the system. To reduce the system by
+    elimination of discontinuous fluxes, use EnableFluxReduction(). Similarly,
+    elimination of potentials (without face integrators) is triggered by
+    EnablePotentialReduction() before the assembling process. Alternatively,
+    the system can be hybridized in terms of the total flux by
+    EnableHybridization(), reducing the system to the trace unknowns through
+    DarcyHybridization. In any case, the reductions are performed in
+    FormSystemMatrix() or FormLinearSystem(), where the original set of the
+    quantities (flux and potential) is recovered though RecoverFEMSolution().
+
+    Additionally, reconstruction of the superconvergent quantities can be
+    performed after solution of the hybridized system has been obtained.
+
+    **The local problem the reconstruction solves is not the assembled problem
+    restricted to an element**, and the difference matters to anyone extending
+    it. It carries the element's flux mass, its divergence and the HDG
+    constraint, all on spaces one order higher, and it is driven by the
+    reconstructed total flux and by the element average of the computed
+    potential. Its trace unknown is free on *every* face, boundary faces
+    included, so a boundary condition reaches it through the total flux rather
+    than through the forms. Only the domain integrators of the mass forms are
+    lifted onto the enriched space for that reason; the potential mass's face
+    integrators reach it by the separate route of the hybridization's
+    potential constraint. Lifting a boundary-face term on the flux mass onto
+    it as well was tried and measured on `miniapps/hdg/extension`, where such a
+    term carries half of a transferred Dirichlet datum: it costs the
+    postprocessed potential its order, k+2 falling to about 1.25, because it
+    imposes one half of a boundary condition against a trace that is free to
+    answer it.
+    It combines the original solution (flux and potential) with the trace
+    solution to obtain the normally continuous total flux through
+    ReconstructTotalFlux(). The second step is reconstruction of the fluxes
+    and potentials with the increased polynomial order through
+    ReconstructFluxAndPot(). Both steps are combined in Reconstruct(). Refer
+    to DarcyHybridization for more detailed explanation of the process.
+ */
+class DarcyForm : public Operator
+{
+public:
+   /** @brief Whether a FACE constraint on the NONLINEAR potential mass form
+       is assembled once or read at every residual.
+
+       Both are bilinear in the unknowns -- an HDG face stabilization is a
+       BilinearFormIntegrator and so is an upwinded convection -- so the type
+       cannot tell them apart and the caller has to say. The question is not
+       what the integrator IS, it is whether its COEFFICIENT moves.
+
+       @a Frozen is the default and is what every existing caller gets: the
+       nonlinear form's face integrators are folded in with the linear form's
+       and assembled once, which is what makes E, G, H and D one-off and the
+       batched face kernel reachable.
+
+       @a Live keeps them on the hybridization's nonlinear slot, where they
+       are evaluated at every residual and every gradient. For a coefficient
+       that is a function of another field of a coupled system -- a drift
+       velocity carrying an unknown, which moves at every Newton step -- that
+       is the difference between re-reading it and re-assembling the whole
+       form to move it. The caller who asked for this measured 92.7 ms of
+       Update() + Assemble() + Finalize() against 8.9 ms for the gradient and
+       1.0 ms for the trace solve: 90% of a coupled Newton step spent
+       assembling in order to move one coefficient.
+
+       It costs the face term's assembly per evaluation, which is the price
+       the frozen route exists to avoid. Ask for it on the form that moves and
+       leave the rest on GetPotentialMassForm(), which stays frozen either
+       way -- the two halves coexist. */
+   enum class FaceConstraintMode
+   {
+      /// Fold into the linear constraint and assemble once (the default).
+      Frozen,
+      /// Keep on the nonlinear slot and re-evaluate at every residual.
+      Live,
+   };
+
+private:
+protected:
+   Array<int> offsets;      ///< block offsets (VDOFs)
+   Array<int> toffsets;     ///< block offsets (TDOFs)
+
+   FiniteElementSpace *fes_u;   ///< flux FE space
+   FiniteElementSpace *fes_p;   ///< potential FE space
+
+   bool bsym;   ///< sign convention, see DarcyForm()
+
+   /// See FaceConstraintMode; read by EnableHybridization() and only there.
+   FaceConstraintMode fc_mode{FaceConstraintMode::Frozen};
+
+   std::unique_ptr<BilinearForm> M_u;       ///< flux mass form
+   std::unique_ptr<BilinearForm> M_p;       ///< potential mass form
+   std::unique_ptr<NonlinearForm> Mnl_u;
+   std::unique_ptr<NonlinearForm> Mnl_p;
+   std::unique_ptr<MixedBilinearForm> B;    ///< flux divergence form
+   std::unique_ptr<BlockNonlinearForm> Mnl;
+   std::unique_ptr<LinearForm> b_u;         ///< flux r.h.s
+   std::unique_ptr<LinearForm> b_p;         ///< potential r.h.s.
+   /** @brief Skeleton r.h.s., on the hybridization's constraint space.
+
+       Unlike @a b_u and @a b_p this owns its storage: @a block_b has two
+       blocks and the skeleton is not one of them. */
+   std::unique_ptr<LinearForm> b_t;
+
+   mutable OperatorHandle opM_u;    ///< flux mass operator
+   mutable OperatorHandle opM_p;    ///< potential mass operator
+   mutable OperatorHandle opB;      ///< flux divergence operator
+   mutable OperatorHandle opBt;     ///< transposed flux divergence operator
+   mutable OperatorHandle opG;
+
+   /// The assembly level of the form (full, partial, etc.)
+   AssemblyLevel assembly{AssemblyLevel::LEGACY};
+
+   std::unique_ptr<BlockOperator> block_op; ///< block operator
+   std::unique_ptr<BlockVector> block_b;    ///< block r.h.s.
+   mutable std::unique_ptr<BlockOperator> block_grad;
+
+   std::unique_ptr<DarcyReduction> reduction;           ///< reduction
+   std::unique_ptr<DarcyHybridization> hybridization;   ///< hybridization
+
+   /// Indicates the Mesh::sequence corresponding to the current state
+   long sequence = -1;
+
+   /** @brief The flux mass of a solution-dependent law, linearised about the
+       computed potential, for the reconstruction below.
+
+       Declared before @a reconstruction so that it outlives the form whose
+       integrator refers to it. */
+   mutable std::unique_ptr<MatrixCoefficient> Mu_nl_coeff;
+
+   /// The DarcyForm of the reconstructed super-convergent system
+   mutable std::unique_ptr<DarcyForm> reconstruction;
+
+   /** @brief The potential mass integrators of a non-linear form, to be frozen
+       at the computed potential by the reconstruction below.
+
+       Referenced, not owned: #Mnl_p keeps the integrators. The list is a
+       reference rather than a lifted form because the Jacobian has to be taken
+       afresh at every call, exactly as #Mu_nl_coeff does for the flux. */
+   mutable Array<NonlinearFormIntegrator*> Mp_nl_lift;
+
+   void UpdateOffsetsAndSize();
+   void UpdateTOffsetsAndSize();
+   void EnableReduction(const Array<int> &ess_flux_tdof_list,
+                        DarcyReduction *reduction);
+
+   /** @brief Assemble the boundary face integrators of the flux mass form into
+       the hybridized element blocks.
+
+       BilinearForm::ComputeElementMatrix(), which the hybridized assembly uses
+       to obtain the element block, sums the *domain* integrators only, so a
+       boundary face integrator added to the flux mass form would otherwise be
+       dropped without a word. The contribution of such an integrator is
+       element-local -- a boundary face belongs to one element -- so it is
+       simply added to that element's block.
+
+       Wanted by the extension-from-subdomains boundary treatment, where the
+       Dirichlet datum on the true boundary is transferred to the computational
+       one along paths and so depends on the flux of the element owning the
+       face; see extension_hdg.hpp.
+
+       @note **NOTHING IN THIS TREE REACHES IT.** Established by grep rather
+       than by reading: no miniapp under miniapps/hdg puts a boundary face
+       integrator on either flux mass form (every AddBdrFaceIntegrator there
+       goes on the divergence form, the potential mass, or a linear form), none
+       of the 152 regression references can, since convdiff has no option that
+       would install one, and **no BilinearFormIntegrator in the library fits
+       any of the three flux spaces this branch uses**: AssembleFaceMatrix()
+       has to return the one-sided block of the adjacent element at
+       (element dofs x vdim) square, and BoundaryMassIntegrator is a scalar
+       MassIntegrator -- vdim times too small on an L2 flux space of vdim =
+       dim, and with no scalar shape to evaluate at all on RT or broken RT --
+       while VectorMassIntegrator and VectorFEMassIntegrator have no
+       AssembleFaceMatrix() to begin with. Claimed of those three spaces and
+       not universally: a scalar (vdim == 1, non-vector) flux space would
+       admit BoundaryMassIntegrator, and nothing here builds one. The two callers in the tree are unit
+       tests, each with an integrator written in the test file
+       (tests/unit/fem/test_darcy_hybridization.cpp and
+       test_darcy_reconstruction.cpp), and the batched pass adds a third.
+
+       @note **"IN THIS TREE" IS DOING REAL WORK IN THE NOTE ABOVE, AND ONE
+       BRANCH FALSIFIES IT.** mfem::HDGExtensionIntegrator, on
+       gf-hdg-subdomains-dev, is exactly the class the paragraph says the
+       library does not contain: a BilinearFormIntegrator whose
+       AssembleFaceMatrix() returns `elmat.SetSize(dof * dim)` over the
+       adjacent element alone, registered with
+       GetFluxMassForm()->AddBdrFaceIntegrator() on a marker, and it is what
+       this routine was written for in the first place. MEQ install it on
+       every curved and free-boundary problem they run, so in their
+       integration tree this path is not merely reachable, it is the
+       production one.
+
+       Two consequences that only exist where the branches meet. The size
+       MFEM_VERIFY in AssembleFluxMassBdrMatricesBatched() is satisfied by
+       that class -- checked by reading extension_hdg.cpp, since neither
+       branch alone can run the pair -- and the batched pass is
+       integrator-agnostic by construction, so it needs nothing from that
+       class and that class needs nothing from it. What neither branch can
+       do is TEST the combination, and nothing has.
+
+       @note **And it is not called at all in parallel.**
+       ParDarcyForm::Assemble() has the element loop but no boundary flux mass
+       pass, so a boundary face integrator on pM_u is silently dropped on more
+       than one rank -- checked by reading pdarcyform.cpp, not fixed here,
+       and untested because the parallel tree is not this worktree's. Boundary
+       elements of a ParMesh are genuine domain boundary and never shared, so
+       the pass itself would be rank-local and correct. */
+   void AssembleFluxMassBdrFaces(int skip_zeros);
+   void AssembleDivLDGFaces(int skip_zeros);
+   void AssemblePotLDGFaces(int skip_zeros);
+   void AssemblePotHDGFaces(int skip_zeros);
+
+   /** @brief Whether Assemble()'s three hybridized element loops may run on
+       several threads.
+
+       They are embarrassingly parallel for a reason that is worth stating,
+       because it is NOT true of DarcyHybridization::ComputeH()'s scatter and
+       that is the loop this one gets compared to: with
+       MFEM_DARCY_HYBRIDIZATION_ELIM_BCS defined -- and it is, in
+       darcyhybridization.hpp -- the `M->AssembleElementMatrix()` call that
+       would scatter into an unfinalized SparseMatrix is compiled OUT of all
+       three, so nothing in the loop body touches a shared sparse structure.
+       What is left writes element @a i's own slice of Af_data / Ae_data (and
+       the divergence and potential equivalents), whose offsets are disjoint
+       by construction. There is no colouring to build and no partial matrix
+       to reduce.
+
+       The one shared write left is `A_empty = false` and the two like it,
+       which every thread sets to the same value on every element.
+
+       Three things must hold, and each is checked rather than assumed:
+       OpenMP must be compiled in; the ELIM_BCS macro must be defined, or the
+       sparse scatter above comes back and the loop is unsafe; and the caller
+       must have promised that the registered integrators are reentrant, via
+       DarcyHybridization::SetIntegratorsThreadSafe(). That last one is not
+       optional here the way it is for MultNL(): these loops exist to
+       EVALUATE domain integrators, so unlike the element-local loops -- where
+       a linear integrator is never evaluated and the promise is only needed
+       when a nonlinear one is installed -- there is no configuration in which
+       this loop is safe without it.
+
+       **And that last point WIDENS what SetIntegratorsThreadSafe() promises,
+       which is an ordering hazard rather than a documentation nicety.** Its
+       existing doxygen, and hdgperf's justification for making the promise
+       under `-lin`, both reason about the integrators MultNL()'s element loop
+       evaluates -- and argue that a LINEAR VectorMassIntegrator does not
+       count because that loop never evaluates it. This loop does. So the same
+       flag now also has to cover the linear DOMAIN integrators. Of the six
+       reachable ones, `VectorMassIntegrator` and `VectorDivergenceIntegrator`
+       -- the two the discontinuous (L2) path installs -- were the only two
+       whose scratch was not declared under `#ifndef MFEM_THREAD_SAFE`;
+       `VectorFEMassIntegrator`, `VectorFEDivergenceIntegrator` and
+       `ConvectionIntegrator` already were. **Both are guarded now**, by the
+       commit that put eight integrators behind that macro, and that commit is
+       a PRECONDITION of this one rather than a companion to it: with those
+       two unguarded, `hdgperf -lin -thr` -- which makes the promise -- would
+       have started racing the moment this landed. The ordering is the whole
+       reason the two changes are separate commits.
+
+       `RestrictedVectorDivergenceIntegrator` is worth knowing about
+       separately: it guards its own `full` but holds a
+       `VectorDivergenceIntegrator` BY VALUE, so it inherited that one's
+       unguarded scratch and guarding it alone would have achieved nothing.
+       Guarding the base fixes it, and changes this class's layout too --
+       which is the layout trap this family has paid for eight times, and why
+       every tree needed a clean build. */
+   bool CanThreadAssembly() const;
+
+   void AllocBlockOp(bool nonconforming = false);
+   void AllocRHS();
+   const Operator* ConstructBT(const MixedBilinearForm *B) const;
+   const Operator* ConstructBT(const OperatorHandle &B) const;
+
+   void NonblockMult(const Vector &x, Vector &y) const;
+
+   void ReconstructFluxAndPot(const DarcyHybridization &h, const GridFunction &pc,
+                              const GridFunction &ut, GridFunction &u, GridFunction &p,
+                              GridFunction &tr,
+                              const Array<NonlinearFormIntegrator*> *Mp_nl = NULL) const;
+
+public:
+   friend class Gradient;
+   class Gradient : public Operator
+   {
+      const DarcyForm &p;
+      const Operator &G;
+      mutable std::unique_ptr<BlockOperator> block_grad;
+      mutable std::array<std::array<std::unique_ptr<SparseMatrix>,2>,2> smats;
+
+   public:
+      Gradient(const DarcyForm &p, const Vector &x)
+         : Operator(p.Width()), p(p), G(p.Mnl->GetGradient(x)) { }
+
+      void Mult(const Vector &x, Vector &y) const override;
+      const BlockOperator& BlockMatrices() const;
+   };
+
+   /// Constructor
+   /** @param fes_u         flux space
+       @param fes_p         potential space
+       @param bsymmetrize   sign convention of the mixed formulation, where
+                            false keeps all terms without a change, while true
+                            flips the sign of B and Mp to obtain a symmetric
+                            system with -Bᵀ in the flux equation
+    */
+   DarcyForm(FiniteElementSpace *fes_u, FiniteElementSpace *fes_p,
+             bool bsymmetrize = true);
+
+   /// Get VDOF block offsets
+   inline const Array<int>& GetOffsets() const { return offsets; }
+
+   /// Get TDOF block offsets
+   inline const Array<int>& GetTrueOffsets() const { return toffsets; }
+
+   /// @name Flux mass
+   ///@{
+
+   /// Get the flux mass form (non-const)
+   /** @note The form is constructed if it has not been already. */
+   BilinearForm *GetFluxMassForm();
+
+   /// Get the flux mass form (const)
+   const BilinearForm *GetFluxMassForm() const { return M_u.get(); }
+
+   NonlinearForm *GetFluxMassNonlinearForm();
+   const NonlinearForm *GetFluxMassNonlinearForm() const { return Mnl_u.get(); }
+
+   ///@}
+
+   /// @name Potential mass
+   ///@{
+
+   /// Get the potential mass form (non-const)
+   /** @note The form is constructed if it has not been already.
+
+       ### A singular reaction coefficient, and how to get the optimal rate
+
+       A zeroth-order term is installed here, as
+       `GetPotentialMassForm()->AddDomainIntegrator(new MassIntegrator(c))`.
+       Where @a c is singular -- @f$ \gamma/x^2 @f$ against a boundary,
+       @f$ \gamma/r @f$ about an interior point -- the rate that comes back
+       is decided by one property, and it is not the one most people reach
+       for.
+
+       **The criterion is compatibility, not integrability.** What matters is
+       whether the solution vanishes at the singular locus fast enough to meet
+       the coefficient there. Whether @f$ \int c\,\phi_i\phi_j @f$ itself
+       converges is not the question, and answers it wrongly in both
+       directions. Measured on the hybridized L2/L2/`DG_Interface` setting at
+       @f$ k = 2 @f$, against the L2 projection of the exact fields as the
+       control for what the space can do at all:
+
+   | @a c | entries | @a p there | best | attained |
+   |---|---|---|---|---|
+   | @f$ .75/x^2 @f$ on x=0 | div. | @f$ x^{1.5} @f$ | 2.17/1.00 | 1.94/0.99 |
+   | none, after @f$ p=x^{1.5}w @f$ | -- | smooth | 3.00/3.00 | 3.00/2.63 |
+   | @f$ .75/r @f$ at a vertex | fin. | @f$ O(1) @f$ | 3.00/3.00 | 1.05/0.75 |
+   | @f$ .75/r @f$ at a vertex | fin. | @f$ O(r^2) @f$ | 3.00/3.00 | 3.02/3.02 |
+
+       Read the last two rows together: one coefficient, one mesh, one
+       smoothness class, and the only difference is the solution. The
+       non-integrable case attains the best-approximation rate and the
+       integrable one loses two orders.
+
+       **So a rate below @f$ k+1 @f$ is not by itself a defect.** Row one is
+       capped at 2 because @f$ x^{1.5} @f$ is in @f$ H^s @f$ only for
+       @f$ s < 2 @f$; no method beats @f$ O(h^2) @f$ there. Take the
+       projection of the exact solution before concluding anything about the
+       discretisation -- without that control an order lost to regularity is
+       indistinguishable from an order lost to the method.
+
+       **What to do when the problem is incompatible.** Change the
+       independent variable. Substituting @f$ p = x^{\beta} w @f$ with
+       @f$ \beta(\beta-1) = \gamma @f$ cancels the reaction exactly and
+       leaves @f$ -\nabla\cdot(x^{2\beta}\nabla w) @f$: a *degenerate*
+       diffusion with no zeroth-order term, whose solution is smooth. That is
+       worth a whole order in the potential and better than an order and a
+       half in the flux (rows one and two). It is not that the discretisation
+       prefers the second chart -- it is optimal in both -- but that the same
+       physical answer is carried there by a smooth function. A vanishing
+       diffusion coefficient then needs a stabilization floor, for which see
+       HDGFloorStabilization.
+
+       **What does not help.** Not the solver: a direct solve reproduces the
+       iterative errors to every printed digit, so the growing iteration
+       counts are the cost of the conditioning and not a failure to converge.
+       Not the load rule: raising it by 8, 24 and 60 leaves the rate at 1.053
+       every time, even though the source carries the singularity too.
+       Raising the *reaction* rule buys accuracy -- 70x -- and pushes the
+       shortfall to finer meshes without removing it, reaching 2.44 against
+       the projection's 3.00. A fixed rule never resolves @f$ 1/r @f$; it
+       only samples nearer to it, and mesh refinement outruns whatever rule
+       was chosen.
+
+       @note Unbounded assembled entries are not by themselves a symptom. In
+       row one they grow from 6.0e4 to 2.1e7 as the quadrature is refined at
+       fixed mesh while the rate stays at 1.94, 1.91, 1.93. They cost
+       conditioning, not accuracy -- the same mechanism a vanishing diffusion
+       coefficient shows in the flux mass block.
+
+       @sa tests/unit/fem/test_darcy_singular.cpp, which pins all four rows.
+   */
+   BilinearForm *GetPotentialMassForm();
+
+   /// Get the potential mass form (const)
+   const BilinearForm *GetPotentialMassForm() const { return M_p.get(); }
+
+   /** @brief Get the nonlinear potential mass form (non-const)
+       @note The form is constructed if it has not been already.
+
+       **Its DOMAIN integrators are read by EnableHybridization() and only
+       there.** One added afterwards is installed into nothing and says so
+       nowhere -- the term is simply absent from the residual and the
+       gradient, and every size and norm still looks right.
+
+       The route afterwards is
+       DarcyHybridization::SetPotMassNonlinearIntegrator(), which is public
+       and which Reset() does NOT clear, so it survives the
+       Update() / Assemble() / Finalize() cycle a re-assembling caller needs.
+       NPC callers are the whole affected population, because NPC lives on the
+       hybridization: a DAE operator wrapping a DarcyForm is handed one that
+       is already hybridized and cannot go back. */
+   NonlinearForm *GetPotentialMassNonlinearForm();
+   const NonlinearForm *GetPotentialMassNonlinearForm() const { return Mnl_p.get(); }
+
+   /** @brief Ask for this form's nonlinear face constraint to be read live.
+
+       Must be set BEFORE EnableHybridization(), which is the only reader:
+       it is what routes GetPotentialMassNonlinearForm()'s face integrators
+       to the hybridization's live slot instead of folding them into the
+       frozen one, and the hybridization is built there. Setting it
+       afterwards does nothing, silently, for the same reason an integrator
+       added to a form afterwards does.
+
+       Live mode needs DarcyHybridization::EnableNPC(); Finalize() refuses
+       otherwise rather than producing a frozen answer.
+
+       **IT COVERS INTERIOR AND BOUNDARY FACES ALIKE**, and it is worth saying
+       because the opposite was reported and measured. DarcyForm::Assemble()
+       sends GetPotentialMassNonlinearForm()'s BOUNDARY face integrators to
+       AddBdrPotConstraintIntegrator()'s NONLINEAR overload under this mode,
+       which is the list ConstructGrad()'s and LocalNLOperator's boundary
+       loops read, and both of those loops sit inside `if (c_nlfi_p)`, which
+       live mode fills. The interior and boundary choices are made from the
+       same flag a few lines apart and cannot disagree. Measured, by moving
+       the BOUNDARY integrator's coefficient alone and leaving the interior
+       one still: the residual and the reduced gradient both track it to
+       1e-16, on 2-D quads, 3-D hexes and 3-D wedges, with and without a
+       boundary face integrator on B or a boundary stabilization on M_p, and
+       on a mesh periodic in one direction.
+
+       **WHAT IT DOES NOT COVER IS A LOAD, AND THAT IS WHERE A CALLER WILL
+       LOSE A DAY.** This mode is about the OPERATOR. A LinearForm carrying
+       the same moving coefficient -- GetPotentialRHS() with a
+       BoundaryFlowIntegrator holding the velocity is the case that arose --
+       has no live route at all and is assembled when Assemble() is called
+       and never again. The caller owes it a re-assembly, which is
+       `rhs->Assemble()` and a copy into the right-hand side, with no
+       Update() and no Finalize() so the gradient is not destroyed.
+
+       **The failure is quiet and it looks exactly like this mode not
+       working.** A consumer measured their live arm at 4.6e-03 from the
+       correctly-assembled operator where an interior-only arm reached
+       3.2e-18, and read it as the boundary faces staying frozen. Reproduced
+       here and attributed by three controls, each of which removes the
+       residue while leaving the constraint untouched: refreshing the load
+       takes 2.2e-02 to 1.8e-16, removing the load integrator gives 1.8e-16,
+       and making the velocity's boundary-NORMAL component zero gives
+       1.8e-16 -- that last being why their interior-only arm looked perfect,
+       since a load whose boundary term is identically zero has nothing to
+       freeze. The discriminator is cheap and worth running before suspecting
+       this mode: **re-assemble the loads and see whether the residue goes.**
+
+       @note An operator taken from NPCGradient() is frozen at the state and
+       the coefficient it was taken at; a later move does not leak into an
+       application of it. Measured bit-identical, which is what makes a
+       gradient safe to hold across a coefficient change. */
+   void SetFaceConstraintMode(FaceConstraintMode mode) { fc_mode = mode; }
+
+   /// See SetFaceConstraintMode().
+   FaceConstraintMode GetFaceConstraintMode() const { return fc_mode; }
+
+   ///@}
+
+   /// @name Flux divergence
+   ///@{
+
+   /// Get the flux divergence form (non-const)
+   /** @note The form is constructed if it has not been already. */
+   MixedBilinearForm *GetFluxDivForm();
+
+   /// Get the flux divergence form (const)
+   const MixedBilinearForm *GetFluxDivForm() const { return B.get(); }
+
+   ///@}
+
+   BlockNonlinearForm *GetBlockNonlinearForm();
+   const BlockNonlinearForm *GetBlockNonlinearForm() const { return Mnl.get(); }
+
+   /// @name Flux r.h.s.
+   ///@{
+
+   /// Get the flux right-hand-side form (non-const)
+   /** @note The form is constructed if it has not been already. */
+   LinearForm *GetFluxRHS();
+
+   /// Get the flux right-hand-side form (const)
+   const LinearForm *GetFluxRHS() const { return b_u.get(); }
+
+   ///@}
+
+   /// @name Potential r.h.s.
+   ///@{
+
+   /** @brief Get the potential right-hand-side form (non-const)
+
+       @note The form is constructed if it has not been already.
+
+       @note WITH A DEVICE CONFIGURED, A CALLER WHO ACCUMULATES THIS INTO ITS
+       OWN BlockVector MUST SyncAliasMemory() AFTERWARDS. The hybridized
+       routines are host loops over raw pointers, and
+
+           rhs.GetBlock(1) += *darcy.GetPotentialRHS();
+
+       is a DEVICE operation on an alias of @a rhs: it leaves the result in
+       that alias's device buffer, and the second view a caller builds to pass
+       to FormLinearSystem() gets a fresh alias marked host-valid whatever the
+       real state, so the loops read stale zeros. Measured under both
+       `-d cuda` and `-d debug`: the reduced trace right-hand side comes back
+       EXACTLY zero, the trace solve returns zero, the recovered fields are
+       quietly wrong, and nothing errors. The validity flags say
+       `hostvalid=1 devvalid=0` on the very block whose host buffer is zeros,
+       so neither a HostRead() nor a guard can catch it.
+
+           rhs.GetBlock(1) += *darcy.GetPotentialRHS();
+           rhs.GetBlock(1).SyncAliasMemory(rhs);      // <-- and this
+
+       Assemble() already does exactly this for the form's own b_u and b_p.
+       None of it applies to a host-only build. */
+   LinearForm *GetPotentialRHS();
+
+   /// Get the potential right-hand-side form (const)
+   const LinearForm *GetPotentialRHS() const { return b_p.get(); }
+
+   ///@}
+
+   /// @name Skeleton r.h.s.
+   ///@{
+
+   /** @brief Get the right-hand-side form on the SKELETON (non-const).
+
+       The third load of the three, and the one this class went without for a
+       long time: a term tested against the trace unknown -- a prescribed
+       numerical flux, a Neumann datum taken weakly on the skeleton -- had no
+       slot, and callers added it by hand to whichever vector their route
+       exposed. Both routes carry it now, and neither needs the caller to do
+       anything beyond assembling into this form.
+
+       @note Requires EnableHybridization() first: the constraint space is not
+             known before that, and this form is built on it. The form is
+             constructed if it has not been already.
+
+       @note The sign is a right-hand side, matching GetFluxRHS() and
+             GetPotentialRHS(): it is ADDED to the reduced trace system and
+             SUBTRACTED from the NPC residual, which are the same convention
+             read off @f$r = A x - b@f$. Worth stating because getting it
+             wrong does NOT stop a solve converging -- it converges to a
+             different answer, by 0.2% in the norm of the trace and 128.7 in
+             the vector on the case that measured it. A test comparing norms,
+             or checking only that Newton converged, passes on a sign error. */
+   LinearForm *GetTraceRHS();
+
+   /// Get the skeleton right-hand-side form (const)
+   const LinearForm *GetTraceRHS() const { return b_t.get(); }
+
+   ///@}
+
+   /// Set the desired assembly level.
+   /** Valid choices are:
+
+       - AssemblyLevel::LEGACY (default)
+       - AssemblyLevel::FULL
+       - AssemblyLevel::PARTIAL
+       - AssemblyLevel::ELEMENT
+       - AssemblyLevel::NONE
+
+       If used, this method must be called before assembly. */
+   void SetAssemblyLevel(AssemblyLevel assembly_level);
+
+   /// Returns the assembly level
+   AssemblyLevel GetAssemblyLevel() const { return assembly; }
+
+   /// Enable flux reduction
+   /** For details see the description for class DarcyFluxReduction. This
+       method should be called before assembly. */
+   void EnableFluxReduction();
+
+   /// Enable potential reduction
+   /** For details see the description for class DarcyPotentialReduction. This
+       method should be called before assembly. */
+   void EnablePotentialReduction(const Array<int> &ess_flux_tdof_list);
+
+   /// Get the applied reduction
+   /** @see EnableFluxReduction() and EnablePotentialReduction() */
+   DarcyReduction *GetReduction() const { return reduction.get(); }
+
+   /// Enable hybridization
+   /** For details see the description for class DarcyHybridization. This
+       method should be called before assembly. */
+   void EnableHybridization(FiniteElementSpace *constr_space,
+                            BilinearFormIntegrator *constr_flux_integ,
+                            const Array<int> &ess_flux_tdof_list);
+
+   /// Get the applied hybridization
+   DarcyHybridization *GetHybridization() const { return hybridization.get(); }
+
+   /// Assembles the form i.e. sums over all integrators
+   /** All bilinear forms are assembled internally, including the right-hand-
+       side linear forms (if they are used). */
+   void Assemble(int skip_zeros = 1);
+
+   /// Finalizes the form
+   /** All bilinear forms are finalized and the internal block operator is
+       constructed for Mult() or GetGradient() methods, or the sparse matrix is
+       assembled in the case of hybridization or reduction. */
+   void Finalize(int skip_zeros = 1);
+
+   /** @brief Form the linear system A X = B, corresponding to this bilinear
+       form and the linear form @a b(.). */
+   /** This method applies any necessary transformations to the linear system
+       such as: eliminating boundary conditions; applying conforming
+       constraints for non-conforming meshes; reduction or hybridization.
+
+       The GridFunction-size vector @a x must contain the essential VDOF
+       values. The right-hand-side vector @a b must be initialized.
+
+       The vector @a X is initialized with a suitable initial guess, the
+       essential entries of @a X are set to the corresponding VDOF values of
+       @a x and all other entries are set to zero (@a copy_interior == 0) or
+       copied from @a x (@a copy_interior != 0). For hybridization or
+       reduction, the values of @a x are not used, but the initial guess can
+       be provided in @a X directly (with @a copy_interior == 0).
+
+       This method can be called multiple times (with the same @a ess_tdof_list
+       array) to initialize different right-hand sides and boundary condition
+       values -- but with hybridization, only if @a B is emptied or zeroed
+       between the calls; see the next paragraph.
+
+       **With hybridization, @a B is an input as well as an output.** If it
+       already has the size of the reduced system, its contents are taken as a
+       load on the trace (in trace true dofs) and the reduction of @a b is
+       ADDED to them; otherwise it is resized and zeroed first. That is how a
+       trace-space LinearForm, such as a Neumann condition, enters the system:
+       miniapps/hdg/darcyop.cpp assembles one into @a B before calling. The
+       consequence is that a second call on the same @a B returns the sum of
+       both reductions, so a caller re-forming the system for a new load
+       passes @a B empty or zeroed. On the nonlinear route the reduction adds
+       nothing and @a B is left as passed. See
+       DarcyHybridization::ReduceRHS(). With reduction, or with no
+       transformation, @a B is overwritten.
+
+       After solving the linear system, the finite element solution @a x can be
+       recovered by calling RecoverFEMSolution() (with the same vectors @a X,
+       @a b, and @a x).
+
+       @note If there are no transformations, @a X simply reuses the data of
+             @a x.
+
+       @note WITH A DEVICE CONFIGURED, A CALLER THAT HOLDS ITS OWN LONG-LIVED
+       MakeRef() ALIASES OF @a x OR @a b OWES A SyncAliasMemory() BEFORE
+       CALLING. This routine and everything under it -- EliminateVDofsInRHS()
+       in particular, whose nonlinear branch reads the two blocks on the
+       host -- are host loops, so they read whatever the base's validity
+       flags claim. An
+       alias written under a device marks the ALIAS device-valid;
+       Memory::SyncAlias() then AliasProtect()s the base's host range and, as
+       its own comment says, leaves the BASE's flags untouched. Every view
+       built from the base afterwards inherits that lie.
+
+       Under `Device("debug")` the result is a named fault on a protected
+       page. Under CUDA nothing is protected, the stale host copy is simply
+       used, and the symptom arrives several layers away -- for one consumer
+       it was "the bordered Jacobian is singular", a message about a border,
+       reported from a solve, two layers from the memory that caused it, and
+       it cost them a day. **A library-side test cannot see a caller's
+       aliases**, which is why this is doxygen and not a guard. The
+       instrument that finds it in an afternoon is `Device("debug")` plus a
+       breakpoint on `mprotect` conditioned on the faulting page, which names
+       the protector directly.
+
+       See GetPotentialRHS() for the same mechanism reached from the other
+       side, where it is the caller's accumulation into @a b rather than into
+       @a x. None of it applies to a host-only build. */
+   virtual void FormLinearSystem(const Array<int> &ess_flux_tdof_list,
+                                 BlockVector &x, BlockVector &b, OperatorHandle &A, Vector &X,
+                                 Vector &B, int copy_interior = 0);
+
+   /** @brief Form the linear system A X = B, corresponding to this bilinear
+       form and its internal right-hand-side linear form. */
+   /** @see FormLinearSystem(const Array<int> &, BlockVector &, BlockVector &,
+                             OperatorHandle &, Vector &, Vector &, int) */
+   virtual void FormLinearSystem(const Array<int> &ess_flux_tdof_list,
+                                 BlockVector &x, OperatorHandle &A, Vector &X, Vector &B,
+                                 int copy_interior = 0);
+
+   /** @brief Form the linear system A X = B, corresponding to this bilinear
+       form and the linear form @a b(.). */
+   /** Version of the method FormLinearSystem() where the system matrix is
+       returned in the variable @a A, of type OpType, holding a *reference* to
+       the system matrix (created with the method OpType::MakeRef()). The
+       reference will be invalidated when SetOperatorType(), Update(), or the
+       destructor is called. */
+   template <typename OpType>
+   void FormLinearSystem(const Array<int> &ess_flux_tdof_list,
+                         BlockVector &x, BlockVector &b,
+                         OpType &A, Vector &X_, Vector &B_,
+                         int copy_interior = 0)
+   {
+      OperatorHandle Ah;
+      FormLinearSystem(ess_flux_tdof_list, x, b, Ah, X_, B_, copy_interior);
+      OpType *A_ptr = Ah.Is<OpType>();
+      MFEM_VERIFY(A_ptr, "invalid OpType used");
+      A.MakeRef(*A_ptr);
+   }
+
+   /** @brief Form the linear system A X = B, corresponding to this bilinear
+       form and its internal right-hand-side linear form. */
+   /** Version of the method FormLinearSystem() where the system matrix is
+       returned in the variable @a A, of type OpType, holding a *reference* to
+       the system matrix (created with the method OpType::MakeRef()). The
+       reference will be invalidated when SetOperatorType(), Update(), or the
+       destructor is called. */
+   template <typename OpType>
+   void FormLinearSystem(const Array<int> &ess_flux_tdof_list,
+                         BlockVector &x, OpType &A, Vector &X_, Vector &B_,
+                         int copy_interior = 0)
+   {
+      OperatorHandle Ah;
+      FormLinearSystem(ess_flux_tdof_list, x, Ah, X_, B_, copy_interior);
+      OpType *A_ptr = Ah.Is<OpType>();
+      MFEM_VERIFY(A_ptr, "invalid OpType used");
+      A.MakeRef(*A_ptr);
+   }
+
+   /// Form the linear system matrix @a A, see FormLinearSystem() for details.
+   virtual void FormSystemMatrix(const Array<int> &ess_flux_tdof_list,
+                                 OperatorHandle &A);
+
+   /// Form the linear system matrix A, see FormLinearSystem() for details.
+   /** Version of the method FormSystemMatrix() where the system matrix is
+       returned in the variable @a A, of type OpType, holding a *reference* to
+       the system matrix (created with the method OpType::MakeRef()). The
+       reference will be invalidated when SetOperatorType(), Update(), or the
+       destructor is called. */
+   template <typename OpType>
+   void FormSystemMatrix(const Array<int> &ess_flux_tdof_list, OpType &A)
+   {
+      OperatorHandle Ah;
+      FormSystemMatrix(ess_flux_tdof_list, Ah);
+      OpType *A_ptr = Ah.Is<OpType>();
+      MFEM_VERIFY(A_ptr, "invalid OpType used");
+      A.MakeRef(*A_ptr);
+   }
+
+   /** @brief Not available, use RecoverFEMSolution(const Vector &, const
+       BlockVector &, BlockVector &) instead. */
+   void RecoverFEMSolution(const Vector &X, const Vector &b, Vector &x) override
+   { MFEM_ABORT("This class uses BlockVectors instead of Vectors."); }
+
+   /// Recover the solution of a linear system formed with FormLinearSystem().
+   /** Call this method after solving a linear system constructed using the
+       FormLinearSystem() method to recover the solution as a GridFunction-size
+       vector in @a x. Use the same arguments as in the FormLinearSystem() call.
+   */
+   virtual void RecoverFEMSolution(const Vector &X, const BlockVector &b,
+                                   BlockVector &x);
+
+   /// Recover the solution of a linear system formed with FormLinearSystem().
+   /** Call this method after solving a linear system constructed using the
+       FormLinearSystem() method to recover the solution as a GridFunction-size
+       vector in @a x. Use the same arguments as in the FormLinearSystem() call.
+   */
+   virtual void RecoverFEMSolution(const Vector &X, BlockVector &x);
+
+   /// Reconstruct the total flux from the provided hybridized solution.
+   /** The total flux function is continuous and its finite element space is
+       assumed to have equal number of DOFs at faces as the trace variable.
+       The definition of the total flux inside the elements is deduced from
+       the potential integrators used. If no finite element space is assigned
+       to the grid function, Raviart-Thomas space is constructed and owned by
+       the function, with `vdim` equal to the potential's.
+
+       @note **Systems.** Both this and ReconstructFluxAndPot() below are
+       general in `vdim`, and the potential's `vdim` is what the number of
+       fields is read from. The trace space must carry the same number; the
+       flux may carry it either way and which one is read from its range type,
+       `neq*dim` on a scalar-range space (L2, H1) and `neq` on an H(div) one.
+       Blocks are laid out as the rest of the branch lays them out -- field
+       outermost -- which is what GetElementVDofs() and GetFaceVDofs() produce
+       locally whatever the space's Ordering is, so neither ordering is
+       required or special-cased. */
+   void ReconstructTotalFlux(const BlockVector &sol, const Vector &sol_r,
+                             GridFunction &ut) const;
+
+   /// Reconstruct the flux, potential and traces from solution and total flux.
+   /** The reconstructed quantities are in finite element spaces of one order
+       higher than the original spaces. If no are assigned to the functions,
+       they are automatically constructed from the primary ones and owned by
+       the functions, carrying the same number of fields.
+
+       For a system the local problem is closed by **one average per field**,
+       each in that field's own block of rows -- see the note in the body,
+       which says why the count and the placement are both forced rather than
+       chosen. Measured on a block-diagonal two-field problem at k = 1 and
+       k = 2, the postprocessed potential gains a full order over the computed
+       one in every field, and field 0 of a system reproduces the same field
+       solved alone to the linear solver's tolerance.
+
+       @note **A system with a solution-dependent flux law needs a
+       discontinuous flux space.** The law is lifted onto the enriched space by
+       freezing it at the computed potential, and FrozenDualFluxCoefficient is
+       neq*dim square -- which is what the VectorMassIntegrator a scalar-range
+       flux space takes wants, and not what VectorFEMassIntegrator wants, that
+       reading a dim-square coefficient and returning an ndof-square block. At
+       neq > 1 on an H(div) flux the element matrix therefore came out neq
+       times too small in each direction and the local solve ran off the end of
+       it; it is a loud refusal now. A block-diagonal wrapper is not the
+       repair, because the law couples the fields and the coupled vector-FE
+       mass it would need does not exist in the tree. The discontinuous flux
+       space has this at every neq, measured on the coupled nonlinear
+       manufactured problem in tests/unit/fem/test_darcy_nonlinear_mms.cpp:
+       k+1 in the computed potential going to k+2 in the postprocessed one, in
+       both fields, at k = 1 and k = 2.
+
+       @note **THE ENRICHED TRACE IS WHICHEVER ELEMENT VISITED THE FACE LAST,
+       and nothing said so before this note.** Each element solves a local
+       problem whose trace is free on every one of its faces, boundary faces
+       included, so the two elements either side of an interior face each
+       produce a value for that face's enriched trace dofs -- and the scatter
+       ASSIGNS, rather than accumulating or averaging. Measured by reversing
+       the element order on one fixed solution: |u*| = 7.9321522926801267 and
+       |p*| = 5.7077841841727244 are identical to seventeen digits both ways,
+       while |tr*| moves 5.4581137616313953 -> 5.3635341954733962, about 2% of
+       its own norm.
+
+       The enriched FLUX shares its face dofs as well whenever its space is
+       conforming -- an RT or broken-RT flux, whose enriched clone is H(div)
+       too -- so formally the same "last writer wins" reaches it. **Measured,
+       it does not matter there, and that is worth knowing rather than
+       assuming.** Scattering from several threads on the RT configuration of
+       tests/unit/fem/test_darcy_threaded_assembly.cpp moves the enriched
+       trace by 1.0e+00 to 8.5e+07 and the enriched flux by 1.8e-15 to
+       6.0e-08 -- round-off against a trace of that size. The two local
+       problems disagree about the trace and agree about the flux, whose
+       normal component both of them pin to the same total flux on the face.
+       The enriched potential is discontinuous in every configuration and is
+       exactly order independent.
+
+       Neither trace value is more right than the other: the two local
+       problems genuinely disagree on the face, that disagreement being the
+       same thing that makes the postprocessed potential superconverge. What a
+       caller comparing two runs needs to know is that the trace is the one
+       field of the three a reordering can move by more than round-off.
+
+       @note **Threaded, and the arrangement is FORCED by the note above.**
+       The element loop runs in parallel when the hybridization is in
+       DarcyHybridization::AssemblyMode::Threaded AND the caller has made the
+       DarcyHybridization::SetIntegratorsThreadSafe() promise. Both, because
+       this loop evaluates two LINEAR FACE integrators -- the flux
+       constraint's AssembleFaceMatrix() and the potential constraint's
+       AssembleHDGFaceMatrix() -- which MultNL()'s audit behind that flag
+       never covered, so a caller who has promised only for that loop has not
+       promised for this one. Without the promise this routine is exactly the
+       serial loop it always was, whatever the mode.
+
+       Because the writes are order dependent, **no colouring can reproduce
+       the serial answer** -- a colouring changes which element writes last,
+       which changes the trace. So the routine SOLVES in parallel and REPLAYS
+       the writes serially in element order, a chunk of elements at a time so
+       that the buffered local solutions are bounded rather than proportional
+       to the mesh. That is bit for bit the serial result at every thread
+       count, pinned by "The threaded rich reconstruction is bit-for-bit the
+       serial one" in tests/unit/fem/test_darcy_threaded_assembly.cpp. Move
+       the scatter inside the parallel region and that case fails on the
+       enriched trace and on nothing else -- 7.7e-02 at two threads on the
+       smallest DG configuration it carries, with the total flux, the enriched
+       flux and the enriched potential all still bit-identical.
+
+       **Measured, MKL pinned to one thread and OMP_WAIT_POLICY=passive**, on
+       DG quadrilaterals and hexahedra, speedup of the whole routine against
+       the serial mode:
+
+           2-D  64^2  k=2   4096 el   0.99  1.74  2.63  4.65 x
+           2-D  96^2  k=1   9216 el   0.92  1.79  2.29  3.47 x
+           3-D  12^3  k=2   1728 el   0.98  1.61  3.03  4.54 x
+                                      nt=1     2     4     8
+
+       The one-thread column is a TAX, not noise: entering a parallel region
+       and rebuilding the per-thread workspace costs 1-8% and the same tax is
+       recorded on the NPC traversal. The k=1 row scales worst because the
+       serial replay is a larger share of a cheaper solve, which is the
+       Amdahl bound this arrangement buys the bit-for-bit answer with.
+
+       DarcyHybridization::ReconstructTotalFlux(), the other half of
+       Reconstruct(), is still serial. */
+   void ReconstructFluxAndPot(const BlockVector &sol, const GridFunction &ut,
+                              GridFunction &u, GridFunction &p, GridFunction &tr) const;
+
+   /// Reconstruct all quantities from hybridized solution.
+   /** The reconstruction combines the reconstruction of the total flux through
+       ReconstructTotalFlux() and the primary quantities through
+       ReconstructFluxAndPot(). See them for details.
+    */
+   void Reconstruct(const BlockVector &sol, const Vector &sol_r, GridFunction &ut,
+                    GridFunction &u, GridFunction &p, GridFunction &tr) const
+   {
+      ReconstructTotalFlux(sol, sol_r, ut);
+      ReconstructFluxAndPot(sol, ut, u, p, tr);
+   }
+
+   /// Use the stored eliminated part of the system to modify the r.h.s.
+   /** @param tdofs_flux   list of flux true DOFs
+       @param x            solution vector providing the true DOF values
+       @param b            (true) right hand side vector
+   */
+   void EliminateTrueDofsInRHS(const Array<int> &tdofs_flux,
+                               const BlockVector &x, BlockVector &b);
+
+   /// Use the stored eliminated part of the system to modify the r.h.s.
+   /** @param vdofs_flux   list of flux VDOFs (non-directional, i.e. >= 0)
+       @param x            solution vector providing the VDOF values
+       @param b            right hand side vector
+   */
+   void EliminateVDofsInRHS(const Array<int> &vdofs_flux,
+                            const BlockVector &x, BlockVector &b);
+
+   /// Operator application
+   void Mult (const Vector & x, Vector & y) const override;
+
+   /// Evaluate the gradient operator at the point @a x.
+   /** Can be used only after Finalize() without enabled hybridization or
+       reduction. */
+   Operator &GetGradient(const Vector &x) const override;
+
+   /// Return the associated flux FE space.
+   FiniteElementSpace *FluxFESpace() { return fes_u; }
+   /// Read-only access to the associated flux FiniteElementSpace.
+   const FiniteElementSpace *FluxFESpace() const { return fes_u; }
+
+   /// Return the associated potential FE space.
+   FiniteElementSpace *PotentialFESpace() { return fes_p; }
+   /// Read-only access to the associated potential FiniteElementSpace.
+   const FiniteElementSpace *PotentialFESpace() const { return fes_p; }
+
+   /** @brief Update the FiniteElementSpace%s and delete all data associated
+       with the old ones. */
+   virtual void Update();
+
+   /// Destroys the form.
+   virtual ~DarcyForm() = default;
+};
+
+}
+
+#endif

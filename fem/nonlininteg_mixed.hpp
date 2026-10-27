@@ -1,0 +1,301 @@
+// Copyright (c) 2010-2024, Lawrence Livermore National Security, LLC. Produced
+// at the Lawrence Livermore National Laboratory. All Rights reserved. See files
+// LICENSE and NOTICE for details. LLNL-CODE-806117.
+//
+// This file is part of the MFEM library. For more information and source code
+// availability visit https://mfem.org.
+//
+// MFEM is free software; you can redistribute it and/or modify it under the
+// terms of the BSD-3 license. We welcome feedback and contributions, see file
+// CONTRIBUTING.md for details.
+
+#ifndef MFEM_NONLININTEG_MIXED
+#define MFEM_NONLININTEG_MIXED
+
+#include "../config/config.hpp"
+#include "nonlininteg.hpp"
+#include "hyperbolic.hpp"
+#include <functional>
+
+namespace mfem
+{
+
+class MixedFluxFunction : public FluxFunction
+{
+public:
+   MixedFluxFunction(const int num_equations, const int dim)
+      : FluxFunction(num_equations, dim) { }
+
+   virtual ~MixedFluxFunction() { }
+
+   virtual real_t ComputeDualFlux(const Vector &state, const DenseMatrix &flux,
+                                  ElementTransformation &Tr,
+                                  DenseMatrix &dualFlux) const = 0;
+
+   virtual void ComputeDualFluxJacobian(const Vector &state,
+                                        const DenseMatrix &flux,
+                                        ElementTransformation &Tr,
+                                        DenseMatrix &J_u, DenseMatrix &J_F) const
+   { MFEM_ABORT("Not Implemented."); }
+};
+
+class LinearDiffusionFlux : public MixedFluxFunction
+{
+   Coefficient *coeff;
+   VectorCoefficient *vcoeff;
+   MatrixCoefficient *mcoeff;
+
+public:
+   LinearDiffusionFlux(int dim, Coefficient &coeff)
+      : MixedFluxFunction(1, dim), coeff(&coeff), vcoeff(NULL), mcoeff(NULL) { }
+
+   LinearDiffusionFlux(VectorCoefficient &vcoeff)
+      : MixedFluxFunction(1, vcoeff.GetVDim()), coeff(NULL), vcoeff(&vcoeff),
+        mcoeff(NULL) { }
+
+   LinearDiffusionFlux(MatrixCoefficient &mcoeff)
+      : MixedFluxFunction(1, mcoeff.GetVDim()), coeff(NULL), vcoeff(NULL),
+        mcoeff(&mcoeff) { }
+
+   real_t ComputeDualFlux(const Vector &, const DenseMatrix &flux,
+                          ElementTransformation &Tr,
+                          DenseMatrix &dualFlux) const override;
+
+   real_t ComputeFlux(const Vector &,
+                      ElementTransformation &,
+                      DenseMatrix &flux) const override;
+
+   void ComputeDualFluxJacobian(const Vector &, const DenseMatrix &flux,
+                                ElementTransformation &Tr,
+                                DenseMatrix &J_u, DenseMatrix &J_F) const override;
+};
+
+class FunctionDiffusionFlux : public MixedFluxFunction
+{
+   typedef std::function<real_t(const Vector &x, real_t u)> Func;
+   typedef std::function<void(const Vector &x, real_t u, Vector &)> VFunc;
+   typedef std::function<void(const Vector &x, real_t u, DenseMatrix &)> MFunc;
+
+   Func func, dfunc;
+   VFunc func_vec, dfunc_vec;
+   MFunc func_mat, dfunc_mat;
+
+public:
+   FunctionDiffusionFlux(int dim, Func f, Func df)
+      : MixedFluxFunction(1, dim), func(std::move(f)),
+        dfunc(std::move(df)) { }
+
+   FunctionDiffusionFlux(int dim, VFunc f, VFunc df)
+      : MixedFluxFunction(1, dim), func_vec(std::move(f)),
+        dfunc_vec(std::move(df)) { }
+
+   FunctionDiffusionFlux(int dim, MFunc f, MFunc df)
+      : MixedFluxFunction(1, dim), func_mat(std::move(f)),
+        dfunc_mat(std::move(df)) { }
+
+   real_t ComputeDualFlux(const Vector &u, const DenseMatrix &flux,
+                          ElementTransformation &Tr,
+                          DenseMatrix &dualFlux) const override;
+
+   real_t ComputeFlux(const Vector &,
+                      ElementTransformation &,
+                      DenseMatrix &flux) const override;
+
+   void ComputeDualFluxJacobian(const Vector &u, const DenseMatrix &flux,
+                                ElementTransformation &Tr,
+                                DenseMatrix &J_u, DenseMatrix &J_F) const override;
+};
+
+class MixedConductionNLFIntegrator : public BlockNonlinearFormIntegrator
+{
+   const MixedFluxFunction &fluxFunction;
+   VectorCoefficient *v;
+   real_t alpha, beta;
+   const IntegrationRule *IntRule;
+
+   /** @brief Per-point scratch, and it is a MEMBER only in a build that
+       cannot thread.
+
+       This integrator is on the element-local hot path: MultNL() and
+       NPCResidual()/NPCGradient() reach it through
+       DarcyHybridization::ConstructGrad() and LocalResidual(), once per
+       element per residual or Jacobian evaluation. Threading that loop
+       therefore needs these to be per-thread, and MFEM's convention for that
+       is to hold them as members only when MFEM_THREAD_SAFE is off and to
+       declare them in the method otherwise -- see
+       FluxFunction::ComputeFluxDotN() for the same pattern. Every method sizes
+       what it uses, so the local declarations are bare. */
+#ifndef MFEM_THREAD_SAFE
+   DenseMatrix vshape_u;
+   Vector shape_u, shape_p, shape1, shape2, shape_tr;
+#endif
+
+   /** @brief Per-variable stabilization for the HDG face terms of a system.
+
+       For a system the stabilization could in principle be a full matrix over
+       the variable index -- the spatial directions are already handled by the
+       flux function -- but a scalar per variable is the natural first choice
+       and is what these terms implement. Empty means one for every variable.
+
+       For a single equation this is unused and the face terms keep deriving
+       the stabilization from the inverse flux Jacobian, so nothing changes. */
+   Vector tau_var;
+
+   /// The stabilization for variable @a e, defaulting to one.
+   real_t TauVar(int e) const
+   { return (tau_var.Size() > e) ? tau_var(e) : 1.0; }
+
+public:
+   /// Construct integrator with $\alpha = 0$ and $\beta = a$.
+   MixedConductionNLFIntegrator(
+      const MixedFluxFunction &fluxFunction,
+      real_t a = 0.5,
+      const IntegrationRule *ir = NULL)
+      : fluxFunction(fluxFunction), v(NULL), alpha(0.), beta(a), IntRule(ir) { }
+
+   /// Construct integrator with $\alpha = a$ and $\beta = a/2$.
+   MixedConductionNLFIntegrator(
+      const MixedFluxFunction &fluxFunction,
+      VectorCoefficient &v_,
+      real_t a = 0.5,
+      const IntegrationRule *ir = NULL)
+      : fluxFunction(fluxFunction), v(&v_), alpha(a), beta(0.5*a), IntRule(ir) { }
+
+   /** @brief Set a scalar stabilization per variable for the HDG face terms.
+
+       Only consulted when the flux function has more than one equation.
+
+       **This is the whole of what a system's HDG face stabilization can be
+       here, and the bound is worth knowing before designing around it.** At
+       neq > 1 both face routines weight by `face_w * TauVar(e)` -- the
+       geometric face weight times one CONSTANT per equation. At neq == 1 the
+       weight is `wq`, derived per quadrature point from the inverse flux
+       Jacobian, so the single-equation case is strictly the more expressive
+       one. So for a system this cannot express a stabilization that depends
+       on the STATE or on the FACE NORMAL.
+
+       The consequence, measured on miniapps/hdg/navierstokes: a CONVECTIVE
+       stabilization that wants both -- Lax-Friedrichs' lambda_max(u_hat, n)
+       -- is expressible only by carrying it on the NumericalFlux instead,
+       which is what that driver does. A VISCOUS stabilization varying with
+       direction has no such escape and could not be written against this
+       class. Nobody has asked for one; if they do, it is a new face
+       integrator and not a setter. */
+   void SetVariableStabilization(const Vector &t) { tau_var = t; }
+
+   /// The constitutive law this integrator was constructed with.
+   const MixedFluxFunction &GetFluxFunction() const { return fluxFunction; }
+
+   /** @brief The rule AssembleElementVector() and AssembleElementGrad()
+       integrate the ELEMENT term at.
+
+       Exposed rather than reconstructed, and that is deliberate: a batched
+       route that copied `2*fe_u.GetOrder() + Tr.OrderW()` would have diverged
+       from this integrator silently the day the expression here changed.
+       HDGDiffusionIntegrator's GetHDGFaceIntRule() exists for the same
+       reason and the two batched paths ask the same way.
+
+       @a Tr is consulted for OrderW() only, so a caller may hand it any
+       element's transformation on a mesh of one geometry. */
+   const IntegrationRule &GetElementIntRule(const FiniteElement &fe_u,
+                                            ElementTransformation &Tr) const;
+   /// The velocity coefficient, or null.
+   VectorCoefficient *GetVelocity() const { return v; }
+   /// The alpha the constructor took.
+   real_t GetAlpha() const { return alpha; }
+   /// The beta the constructor took.
+   real_t GetBeta() const { return beta; }
+   /// The per-variable stabilization for variable @a e, defaulting to one.
+   real_t GetVariableStabilization(int e) const { return TauVar(e); }
+
+   /** @brief The rule the HDG face routines integrate at, asked of the
+       integrator rather than reconstructed.
+
+       ONE SOURCE OF TRUTH, the same argument as
+       HDGDiffusionIntegrator::GetHDGFaceIntRule(): AssembleHDGFaceVector()
+       and AssembleHDGFaceGrad() call this, so a batched driver that also
+       calls it cannot integrate at a different rule. Note it takes the FLUX
+       element as well as the potential one -- the max over both is what these
+       routines use, and the comma operator that once discarded the flux order
+       here was a defect. */
+   const IntegrationRule &GetHDGFaceIntRule(
+      const FiniteElement &el_u, const FiniteElement &el_p,
+      FaceElementTransformations &Tr) const
+   {
+      if (IntRule) { return *IntRule; }
+      const int order = 2 * std::max(el_u.GetOrder(), el_p.GetOrder());
+      return IntRules.Get(Tr.GetGeometryType(), order);
+   }
+
+   void AssembleElementVector(const Array<const FiniteElement*> &el,
+                              ElementTransformation &Tr,
+                              const Array<const Vector*> &elfun,
+                              const Array<Vector*> &elvect) override;
+
+   void AssembleFaceVector(const Array<const FiniteElement *> &el1,
+                           const Array<const FiniteElement *> &el2,
+                           FaceElementTransformations &Tr,
+                           const Array<const Vector *> &elfun,
+                           const Array<Vector *> &elvect) override;
+
+   void AssembleElementGrad(const Array<const FiniteElement*> &el,
+                            ElementTransformation &Tr,
+                            const Array<const Vector *> &elfun,
+                            const Array2D<DenseMatrix *> &elmats) override;
+
+   void AssembleFaceGrad(const Array<const FiniteElement *>&el1,
+                         const Array<const FiniteElement *>&el2,
+                         FaceElementTransformations &Tr,
+                         const Array<const Vector *> &elfun,
+                         const Array2D<DenseMatrix *> &elmats) override;
+
+   void AssembleHDGFaceVector(int type,
+                              const FiniteElement &trace_face_fe,
+                              const Array<const FiniteElement *>&el,
+                              FaceElementTransformations &Tr,
+                              const Vector &trfun,
+                              const Array<const Vector *> &elfun,
+                              const Array<Vector *> &elvect) override;
+
+   void AssembleHDGFaceGrad(int type,
+                            const FiniteElement &trace_face_fe,
+                            const Array<const FiniteElement *>&el,
+                            FaceElementTransformations &Tr,
+                            const Vector &trfun,
+                            const Array<const Vector *> &elfun,
+                            const Array2D<DenseMatrix *> &elmats) override;
+};
+
+/** @brief The dual-flux Jacobian of a MixedFluxFunction, frozen at a given
+    potential, as a matrix coefficient.
+
+    Superconvergent postprocessing solves a *linear* local Darcy problem on
+    enriched spaces, so a solution-dependent constitutive law has to be
+    linearised somewhere, and the converged potential is the place: for a law
+    q = D(p) u this evaluates D(p_h(x)) exactly. The size is
+    num_equations * dim, which is what VectorMassIntegrator wants for an L2
+    flux space of that vdim, and plain dim for a single equation, which is what
+    VectorFEMassIntegrator wants for Raviart-Thomas.
+
+    The potential is held by value, so the coefficient outlives whatever
+    produced it. */
+class FrozenDualFluxCoefficient : public MatrixCoefficient
+{
+   const MixedFluxFunction &fun;
+   GridFunction pot;
+   mutable Vector state;
+   mutable DenseMatrix flux, J_u;
+
+public:
+   /// Freeze @a fun at the potential @a p, of which a copy is taken.
+   FrozenDualFluxCoefficient(const MixedFluxFunction &fun,
+                             const GridFunction &p)
+      : MatrixCoefficient(fun.num_equations * fun.dim), fun(fun), pot(p) { }
+
+   void Eval(DenseMatrix &K, ElementTransformation &T,
+             const IntegrationPoint &ip) override;
+};
+
+}
+
+#endif
