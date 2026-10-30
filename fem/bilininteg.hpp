@@ -4902,6 +4902,10 @@ private:
 public:
    NormalTraceJumpIntegrator(real_t sign_ = 1.) : sign(sign_) { }
 
+   /// The sign the constraint is assembled with, for a batched assembly that
+   /// reproduces AssembleFaceMatrix() without calling it.
+   real_t GetSign() const { return sign; }
+
    using BilinearFormIntegrator::AssembleFaceMatrix;
    void AssembleFaceMatrix(const FiniteElement &trial_face_fe,
                            const FiniteElement &test_fe1,

@@ -337,6 +337,47 @@ protected:
                               GridFunction &tr,
                               const Array<NonlinearFormIntegrator*> *Mp_nl = NULL) const;
 
+   /** @brief The local problems of ReconstructFluxAndPot() assembled, factored
+       and solved in batches, one element per kernel thread, on whatever
+       Device is configured.
+
+       Called on the RECONSTRUCTION form, as the per-element route is. Its
+       pieces: the flux mass and the divergence from HDGElementMassBatched()
+       and HDGElementDivBatched() on the enriched spaces, the constraint from
+       HDGNormalTraceJumpBatched() and the potential constraint from
+       HDGFaceSideBatched() for every (element, face) pair, the right-hand
+       side and the closure from reference tables and HDGElementGeometry, and
+       BatchedLinAlg's LU. In chunks bounded in reals, because every local
+       matrix at once is 1.4 GB on meq's largest mesh.
+
+       **The enriched trace is the serial replay's, without the replay.** The
+       replay leaves on each face the solution of the LAST element in element
+       order to list it, so that is the face's owner, and the owner alone
+       writes it: no race, and the same choice the per-element route makes.
+
+       Returns false, having done nothing, unless ReconstructionCanBatch(). */
+   bool ReconstructFluxAndPotBatched(const DarcyHybridization &h,
+                                     const GridFunction &pc,
+                                     const GridFunction &ut, GridFunction &u,
+                                     GridFunction &p, GridFunction &tr,
+                                     const Array<NonlinearFormIntegrator*> *Mp_nl)
+   const;
+
+   /** @brief Whether ReconstructFluxAndPotBatched() can take this
+       reconstruction form, with @a h's constraints, on these spaces.
+
+       AssemblyMode::Batched on @a h; a serial mesh; one field; a flux mass and
+       a divergence the element kernels take; NO lifted convective or
+       hyperbolic term (they are assembled by their own integrators); a flux
+       constraint HDGNormalTraceJumpCanBatch() takes and a linear potential
+       constraint HDGFaceSideCanBatch() takes; a scalar RT total flux without
+       a DofTransformation, whose face dofs match the enriched trace's. */
+   bool ReconstructionCanBatch(const DarcyHybridization &h,
+                               const FiniteElementSpace &fes_tr,
+                               const FiniteElementSpace &fes_pc,
+                               const FiniteElementSpace &fes_ut,
+                               const Array<NonlinearFormIntegrator*> *Mp_nl) const;
+
 public:
    friend class Gradient;
    class Gradient : public Operator
@@ -961,9 +1002,31 @@ public:
        Amdahl bound this arrangement buys the bit-for-bit answer with.
 
        DarcyHybridization::ReconstructTotalFlux(), the other half of
-       Reconstruct(), is still serial. */
+       Reconstruct(), is threaded the same way (that sentence used to say it
+       was serial, and had not been true for some time).
+
+       **Under AssemblyMode::Batched both halves are kernels**, where the
+       configuration allows: ReconstructFluxAndPotBatched() for this one and
+       DarcyHybridization::ReconstructTotalFluxBatched() for the total flux.
+       Under a Device, where these host loops run on one core, that is the
+       route: on meq's problem shape, 103k triangles at k = 2 on an RTX 2070,
+       the two halves went from 4.8 s and 10.1 s to 0.55 s and 1.4 s, and what
+       is left is mostly the host's evaluation of a FunctionCoefficient and
+       of the stabilization hook at the face points. CanBatchReconstruction()
+       says, after a call, which route it took. */
    void ReconstructFluxAndPot(const BlockVector &sol, const GridFunction &ut,
                               GridFunction &u, GridFunction &p, GridFunction &tr) const;
+
+   /** @brief Whether the LAST ReconstructFluxAndPot() into these grid
+       functions took the batched route, ReconstructFluxAndPotBatched().
+
+       Asked after the call, because the call is what builds the enriched
+       spaces and the reconstruction form it asks about. Under
+       AssemblyMode::Batched on the hybridization; see
+       ReconstructionCanBatch() for the rest. */
+   bool CanBatchReconstruction(const GridFunction &ut, const GridFunction &u,
+                               const GridFunction &p,
+                               const GridFunction &tr) const;
 
    /// Reconstruct all quantities from hybridized solution.
    /** The reconstruction combines the reconstruction of the total flux through

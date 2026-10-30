@@ -17,11 +17,61 @@
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <map>
 #include <vector>
 
 namespace mfem
 {
+
+namespace
+{
+
+/** @brief Whether the level-set setup loops below may run threaded.
+
+    The caller's promise about @a phi first, since nothing here can audit a
+    std::function. Then OpenMP, without which a pragma is a serial loop. Then
+    no Device: MFEM's memory bookkeeping is live only when one is configured,
+    and it is not thread-safe -- a Vector allocated inside the region would
+    reach it. A threaded element loop under Device("debug") was measured to
+    abort in MmuHostMemorySpace::Dealloc for exactly that reason, on the NPC
+    branch. And, where the loop maps reference points through
+    Mesh::GetElementTransformation(), no nodes: with nodes that call reads
+    them through the nodal space's one-argument GetElementVDofs(), which
+    writes the space's shared DofTransformation. */
+bool LevelSetLoopsThread(const Mesh &mesh, bool phi_thread_safe,
+                         bool maps_points)
+{
+#ifdef MFEM_USE_OPENMP
+   if (!phi_thread_safe) { return false; }
+   if (Device::Allows(Backend::DEVICE_MASK)) { return false; }
+   if (maps_points && mesh.GetNodes()) { return false; }
+   return true;
+#else
+   (void)mesh; (void)phi_thread_safe; (void)maps_points;
+   return false;
+#endif
+}
+
+/** @brief The first exception thrown inside an OpenMP region, carried out of
+    it. A throw may not leave the region -- it is std::terminate, even with
+    the region's `if` false -- so each iteration catches, the first is kept,
+    and it is rethrown after the region closes. */
+struct LevelSetLoopTrap
+{
+   std::exception_ptr first;
+   void Capture()
+   {
+#ifdef MFEM_USE_OPENMP
+      #pragma omp critical (LevelSetLoopTrap)
+#endif
+      { if (!first) { first = std::current_exception(); } }
+   }
+   void Rethrow() { if (first) { std::rethrow_exception(first); } }
+};
+
+} // namespace
+
 
 void TransferPath::Endpoint(FaceElementTransformations &FTr,
                             const IntegrationPoint &ip, Vector &xbar) const
@@ -75,13 +125,19 @@ VectorPositionFunction ClosestPointPath::Sphere(const Vector &c, real_t R)
 namespace
 {
 
-/// The distance along a ray from @a x below which a crossing cannot be told
-/// from the origin: the bisection's bracket, or what the format resolves about
-/// @a x, whichever is the larger.
+/// What the format resolves of a crossing along a ray of @a length from @a x,
+/// which is where FirstCrossing()'s bisection stops.
+real_t BisectionResolution(const Vector &x, real_t length)
+{
+   return std::numeric_limits<real_t>::epsilon() * (x.Normlinf() + length);
+}
+
+/// How far outside @f$\Gamma@f$ an origin may lie and still count as on it:
+/// @a tol times @a length, or BisectionResolution(), whichever is the larger.
+/// This is the only thing @a tol sets.
 real_t CrossingResolution(const Vector &x, real_t length, real_t tol)
 {
-   return std::max(tol * length, std::numeric_limits<real_t>::epsilon()
-                   * (x.Normlinf() + length));
+   return std::max(tol * length, BisectionResolution(x, length));
 }
 
 /** @brief March from @a x along the unit direction @a dir and bisect the first
@@ -127,14 +183,21 @@ bool FirstCrossing(const PositionFunction &phi, const Vector &x,
    }
    if (tb < 0.) { return false; }
 
-   // The bracket target tol * length is absolute, and with the 1e-13 default
-   // it is below what single precision can represent. So the loop also stops
-   // when the midpoint no longer moves: the crossing is then located as well
-   // as the format allows. Without that, every ray in a single build ran to
-   // max_iter at the right answer (MEQ: 27 s of setup against 9). In double
-   // the bracket target is reached first, so nothing changes there.
-   const real_t ttol = tol * length;
-   for (int it = 0; it < max_iter && tb - ta > ttol; it++)
+   // BISECT UNTIL THE MIDPOINT STOPS MOVING, WHATEVER tol IS. The endpoint
+   // is differenced along the face when a family has no closed-form
+   // derivative, and a bisection stopped at a bracket of tol * length makes
+   // it a staircase in the face point, with steps up to that bracket: at
+   // 1e-13 times six element sizes, 2.4e-13, which a central difference at a
+   // physical step near 1e-7 turns into an error near 1e-6 in da/dxi. MEQ
+   // measured psi_h moving by 1e-6 to 1e-5 with the step alone at tol =
+   // 1e-13, and by 1e-8 at tol = 0, with no measurable change in wall time.
+   // So tol keeps only its other job, CrossingResolution()'s allowance for an
+   // origin just outside Gamma. In single precision the old bracket target
+   // was below what the format can represent, which is where the midpoint
+   // test came from (MEQ: 27 s of setup against 9 with every ray run to
+   // max_iter); the default max_iter, 100, is ample for double, whose
+   // bisection needs about 45 halvings from a 1/32 bracket.
+   for (int it = 0; it < max_iter; it++)
    {
       const real_t tm = 0.5 * (ta + tb);
       if (tm <= ta || tm >= tb) { break; }
@@ -144,6 +207,114 @@ bool FirstCrossing(const PositionFunction &phi, const Vector &x,
 
    t = 0.5 * (ta + tb);
    return true;
+}
+
+/** @brief The outward unit normal @a n of the face of @a FTr at its set
+    point, as TransferPath::Endpoint() takes it, and its derivative @a dn
+    along the face's reference coordinates, SDIM x (SDIM - 1).
+
+    Zero on a face whose Jacobian is constant. On a curved one it comes from
+    the face map's Hessian, whose columns are ordered xx, xy, yy: with
+    @f$\nu@f$ CalcOrtho()'s unnormalised normal, @f$n' = (\nu' - n(n\cdot
+    \nu'))/|\nu|@f$, where @f$\nu' = (x_{\xi\xi,1}, -x_{\xi\xi,0})@f$ in
+    two dimensions and @f$\nu = x_{\xi_0}\times x_{\xi_1}@f$ is
+    differentiated by the product rule in three. */
+void FaceNormalDerivative(FaceElementTransformations &FTr, Vector &n,
+                          DenseMatrix &dn)
+{
+   const int sdim = FTr.GetSpaceDim(), fdim = sdim - 1;
+   Vector nu(sdim);
+   CalcOrtho(FTr.Jacobian(), nu);
+   const real_t len = nu.Norml2();
+   n = nu;
+   n /= len;
+
+   dn.SetSize(sdim, fdim);
+   dn = 0.;
+   if (FTr.OrderJ() == 0) { return; }
+
+   const DenseMatrix &J = FTr.Jacobian();
+   const DenseMatrix &H = FTr.Hessian();
+   Vector dnu(sdim);
+   for (int k = 0; k < fdim; k++)
+   {
+      if (sdim == 2)
+      {
+         dnu(0) = H(1, 0);
+         dnu(1) = -H(0, 0);
+      }
+      else
+      {
+         // d(c0 x c1) = dc0 x c1 + c0 x dc1, with c_j = J(:, j) and
+         // d c_j / d xi_k = H(:, j + k).
+         auto cross_add = [&](const real_t *a, const real_t *b)
+         {
+            dnu(0) += a[1] * b[2] - a[2] * b[1];
+            dnu(1) += a[2] * b[0] - a[0] * b[2];
+            dnu(2) += a[0] * b[1] - a[1] * b[0];
+         };
+         const real_t c0[3] = { J(0, 0), J(1, 0), J(2, 0) };
+         const real_t c1[3] = { J(0, 1), J(1, 1), J(2, 1) };
+         const real_t d0[3] = { H(0, k), H(1, k), H(2, k) };
+         const real_t d1[3] = { H(0, k + 1), H(1, k + 1), H(2, k + 1) };
+         dnu = 0.;
+         cross_add(d0, c1);
+         cross_add(c0, d1);
+      }
+      const real_t nd = n * dnu;
+      for (int d = 0; d < sdim; d++) { dn(d, k) = (dnu(d) - nd * n(d)) / len; }
+   }
+}
+
+/** @brief @f$\partial a/\partial\xi@f$ for the endpoint @a xbar @f$= x +
+    s\,t@f$ of a ray along the unit direction @a t, given the face's
+    Jacobian @a dx and the direction's derivative @a dt, both SDIM x FDIM.
+
+    Differentiating @f$\phi(x + s\,t) = 0@f$ along the face gives
+    @f$s' = -\nabla\phi\cdot(x' + s\,t')/(\nabla\phi\cdot t)@f$, and
+    @f$a' = x' + s\,t' + s'\,t@f$.
+
+    **A ray grazing @f$\Gamma@f$ is refused, and aborts.** As
+    @f$\nabla\phi\cdot t \to 0@f$, @f$s'@f$ diverges: the crossing slides
+    along @f$\Gamma@f$ without bound as the start moves, and past tangency
+    the ray misses that piece of @f$\Gamma@f$ and jumps to a farther one.
+    That is the path map's, not the formula's, so a central difference there
+    is no better, only quieter. Refused at @f$|\nabla\phi\cdot t| \le
+    \sqrt\epsilon|\nabla\phi|@f$, where the quotient has no digits left,
+    and for a gradient that is not finite. CheckPathIncidence() finds the
+    shallow paths before a solve does. @a be is FTr.ElementNo, for the
+    message. */
+void RayEndpointJacobian(const VectorPositionFunction &grad_phi,
+                         const Vector &xbar, const Vector &t, real_t s,
+                         const DenseMatrix &dx, const DenseMatrix &dt,
+                         int be, DenseMatrix &dadxi)
+{
+   const int sdim = xbar.Size(), fdim = dx.Width();
+   Vector g(sdim);
+   grad_phi(xbar, g);
+   MFEM_VERIFY(g.Size() == sdim, "the level set's gradient has "
+               << g.Size() << " components in " << sdim << " dimensions");
+   const real_t gt = g * t;
+   const real_t eps = std::numeric_limits<real_t>::epsilon();
+   MFEM_VERIFY(std::abs(gt) > std::sqrt(eps) * g.Norml2() && g.CheckFinite() == 0,
+               "the path from boundary element (or face) " << be << " meets "
+               "Gamma at "
+               "xbar = (" << xbar(0) << ", " << xbar(1)
+               << (sdim > 2 ? ", " + std::to_string(xbar(2)) : std::string())
+               << ") at a grazing angle, |grad phi . t| / |grad phi| = "
+               << std::abs(gt) / g.Norml2() << " (or the gradient is not "
+               "finite): its endpoint has no derivative along the face there. "
+               "The family's directions need changing; CheckPathIncidence() "
+               "finds such paths before a solve.");
+
+   dadxi.SetSize(sdim, fdim);
+   Vector v(sdim);
+   for (int i = 0; i < fdim; i++)
+   {
+      for (int d = 0; d < sdim; d++) { v(d) = dx(d, i) + s * dt(d, i); }
+      const real_t ds = -(g * v) / gt;
+      for (int d = 0; d < sdim; d++) { dadxi(d, i) = v(d) + ds * t(d); }
+   }
 }
 
 } // namespace
@@ -223,10 +394,38 @@ void LevelSetPath::Endpoint(const Vector &x, const Vector &n,
    for (int d = 0; d < dim; d++) { xbar(d) = x(d) + t * n(d); }
 }
 
+bool LevelSetPath::EndpointJacobian(FaceElementTransformations &FTr,
+                                    const IntegrationPoint &ip,
+                                    DenseMatrix &dadxi) const
+{
+   const int sdim = FTr.GetSpaceDim();
+   if (!grad_phi || sdim < 2) { return false; }
+
+   // The point, the normal and the crossing exactly as Endpoint() takes them,
+   // so the derivative is of the map the quadrature evaluates.
+   Vector x(sdim), n(sdim), xbar(sdim);
+   DenseMatrix dn;
+   FTr.SetAllIntPoints(&ip);
+   FTr.Transform(ip, x);
+   FaceNormalDerivative(FTr, n, dn);
+   const DenseMatrix dx(FTr.Jacobian());
+   real_t s;
+   MFEM_VERIFY(FirstCrossing(phi, x, n, search_length, search_steps, tol,
+                             max_iter, s),
+               "the ray along the outward normal never meets the level set "
+               "within the search length " << search_length);
+   for (int d = 0; d < sdim; d++) { xbar(d) = x(d) + s * n(d); }
+
+   RayEndpointJacobian(grad_phi, xbar, n, s, dx, dn,
+                       FTr.ElementNo, dadxi);
+   return true;
+}
+
 VertexConePath::VertexConePath(const Mesh &mesh_, int gamma_h_attr,
                                PositionFunction phi_, real_t search_length_,
                                int n_rays_, int n_keep_, int search_steps_,
-                               real_t tol_, int max_iter_, bool use_cone_)
+                               real_t tol_, int max_iter_, bool use_cone_,
+                               bool phi_thread_safe_)
    : mesh(&mesh_), phi(std::move(phi_)), search_length(search_length_),
      n_rays(n_rays_), n_keep(n_keep_), search_steps(search_steps_),
      max_iter(max_iter_), tol(tol_)
@@ -289,22 +488,39 @@ VertexConePath::VertexConePath(const Mesh &mesh_, int gamma_h_attr,
       const Mesh &bg = *sub->GetParent();
       const Array<int> &pv = sub->GetParentVertexIDMap();
 
-      // Background edges incident on each parent vertex, once.
-      std::map<int, std::vector<int>> edges_at;
+      // Background edges incident on each parent vertex, once, as a flat
+      // vertex-to-edge table: two passes over the edges in edge order, so each
+      // vertex lists its edges in the order the std::map this replaces did.
+      // That map cost a node allocation per vertex of the WHOLE background --
+      // 244k elements in meq's case -- to serve the few Gamma_h touches.
+      const int nbv = bg.GetNV();
+      Array<int> eoff(nbv + 1), eat;
+      eoff = 0;
       Array<int> ev;
       for (int e = 0; e < bg.GetNEdges(); e++)
       {
          const_cast<Mesh &>(bg).GetEdgeVertices(e, ev);
-         edges_at[ev[0]].push_back(e);
-         edges_at[ev[1]].push_back(e);
+         eoff[ev[0] + 1]++;
+         eoff[ev[1] + 1]++;
+      }
+      eoff.PartialSum();
+      eat.SetSize(eoff[nbv]);
+      {
+         Array<int> fill(eoff);
+         for (int e = 0; e < bg.GetNEdges(); e++)
+         {
+            const_cast<Mesh &>(bg).GetEdgeVertices(e, ev);
+            eat[fill[ev[0]]++] = e;
+            eat[fill[ev[1]]++] = e;
+         }
       }
 
       for (auto &kv : vertex_normals)
       {
          const int sv = kv.first;
          if (sv >= pv.Size()) { continue; }
-         auto it = edges_at.find(pv[sv]);
-         if (it == edges_at.end()) { continue; }
+         const int bv = pv[sv];
+         if (eoff[bv + 1] == eoff[bv]) { continue; }
 
          const real_t *c = bg.GetVertex(pv[sv]);
          const Array<real_t> &ns = kv.second;
@@ -315,8 +531,9 @@ VertexConePath::VertexConePath(const Mesh &mesh_, int gamma_h_attr,
          // uses, applied to the background's own edges rather than to a
          // continuum of angles.
          std::vector<real_t> ang;
-         for (int e : it->second)
+         for (int ei = eoff[bv]; ei < eoff[bv + 1]; ei++)
          {
+            const int e = eat[ei];
             const_cast<Mesh &>(bg).GetEdgeVertices(e, ev);
             const int other = (ev[0] == pv[sv]) ? ev[1] : ev[0];
             const real_t *o = bg.GetVertex(other);
@@ -363,21 +580,74 @@ VertexConePath::VertexConePath(const Mesh &mesh_, int gamma_h_attr,
 
    n_gamma_h_vertices = (int)vertex_normals.size();
 
-   // A direction at each of those vertices.
-   std::map<int, std::array<real_t, 2>> vertex_tangent;
-   Vector x(2), t(2);
+   // A direction at each of those vertices. This is where the constructor's
+   // time goes -- a fan of rays per vertex, each a march and a root find
+   // through the level set -- and each vertex is searched alone, so with the
+   // caller's promise about phi it runs threaded. The vertices are taken out
+   // of the map first because an OpenMP loop wants an index; the maps are
+   // only READ inside the region. The tallies VertexDirection() keeps are
+   // per thread and summed after, and a vertex that finds no ray is reported
+   // after the region, since nothing may be thrown out of one.
+   std::vector<int> vlist;
+   std::vector<const Array<real_t>*> nlist;
+   vlist.reserve(vertex_normals.size());
+   nlist.reserve(vertex_normals.size());
    for (auto &kv : vertex_normals)
    {
-      const real_t *c = m.GetVertex(kv.first);
-      x(0) = c[0]; x(1) = c[1];
-      real_t cc = 0., ch = -1.;
-      auto ic = vertex_cone.find(kv.first);
-      if (ic != vertex_cone.end()) { cc = ic->second[0]; ch = ic->second[1]; }
-      MFEM_VERIFY(VertexDirection(x, kv.second, cc, ch, t),
-                  "no ray from the vertex (" << x(0) << ", " << x(1)
+      vlist.push_back(kv.first);
+      nlist.push_back(&kv.second);
+   }
+   const int nvx = (int)vlist.size();
+   std::vector<std::array<real_t, 2>> tv(nvx);
+   std::vector<char> found(nvx, 0);
+   int widened = 0, coned = 0, tighter = 0;
+   const bool threaded = LevelSetLoopsThread(m, phi_thread_safe_, false);
+   (void)threaded;   // read only by the pragma
+   LevelSetLoopTrap trap;
+#ifdef MFEM_USE_OPENMP
+   #pragma omp parallel if (threaded) reduction(+:widened, coned, tighter)
+#endif
+   {
+      Vector xv(2), tt(2);
+      int counts[3] = {0, 0, 0};
+#ifdef MFEM_USE_OPENMP
+      // Dynamic: a vertex whose fan has to be widened costs several times
+      // one that does not, and they cluster where Gamma_h is rough.
+      #pragma omp for schedule(dynamic, 16)
+#endif
+      for (int k = 0; k < nvx; k++)
+      {
+         try
+         {
+            const real_t *c = m.GetVertex(vlist[k]);
+            xv(0) = c[0]; xv(1) = c[1];
+            real_t cc = 0., ch = -1.;
+            auto ic = vertex_cone.find(vlist[k]);
+            if (ic != vertex_cone.end()) { cc = ic->second[0]; ch = ic->second[1]; }
+            found[k] = VertexDirection(xv, *nlist[k], cc, ch, tt, counts) ? 1 : 0;
+            if (found[k]) { tv[k] = {{tt(0), tt(1)}}; }
+         }
+         catch (...) { trap.Capture(); }
+      }
+      widened += counts[0];
+      coned += counts[1];
+      tighter += counts[2];
+   }
+   trap.Rethrow();
+   n_widened += widened;
+   n_coned += coned;
+   n_tighter += tighter;
+
+   std::map<int, std::array<real_t, 2>> vertex_tangent;
+   Vector x(2);
+   for (int k = 0; k < nvx; k++)
+   {
+      const real_t *c = m.GetVertex(vlist[k]);
+      MFEM_VERIFY(found[k],
+                  "no ray from the vertex (" << c[0] << ", " << c[1]
                   << ") of Gamma_h reaches Gamma within the search length "
                   << search_length);
-      vertex_tangent[kv.first] = {{t(0), t(1)}};
+      vertex_tangent[vlist[k]] = tv[k];
    }
 
    // Per face, those two tangents in the order its reference coordinate visits
@@ -421,7 +691,8 @@ VertexConePath::VertexConePath(const Mesh &mesh_, int gamma_h_attr,
 bool VertexConePath::VertexDirection(const Vector &x,
                                      const Array<real_t> &normals,
                                      real_t cone_centre, real_t cone_half,
-                                     Vector &t)
+                                     Vector &t,
+                                     int counts[3]) const
 {
    const int m = normals.Size() / 2;
    MFEM_VERIFY(m >= 1, "a vertex of Gamma_h with no face");
@@ -471,10 +742,10 @@ bool VertexConePath::VertexDirection(const Vector &x,
    // below deliberately leave both behind.
    if (cone_half > 0.)
    {
-      if (half_width <= 0. || cone_half < half_width) { n_tighter++; }
+      if (half_width <= 0. || cone_half < half_width) { counts[2]++; }
       centre_angle = cone_centre;
       half_width = cone_half;
-      n_coned++;
+      counts[1]++;
    }
 
    // A vertex ON Gamma -- where Gamma meets the background's boundary, or
@@ -489,13 +760,13 @@ bool VertexConePath::VertexDirection(const Vector &x,
    // below as it approaches Gamma: a crossing at s = |phi| / slope ranks the
    // rays by the slope of phi along them, and the mean of the nearest
    // endpoints weights each direction by 1 / slope. The switch is where the
-   // bisection's error in s (CrossingResolution(), r) and the limit's own
+   // bisection's error in s (BisectionResolution(), r) and the limit's own
    // (s times the curvature, taken on the scale of the search) are equal,
    // sqrt(r L); either side of it the two agree to that, and the direction
    // is continuous through it.
    const real_t phi0 = phi(x);
    const real_t eps = std::numeric_limits<real_t>::epsilon();
-   const real_t on_gamma = std::sqrt(CrossingResolution(x, search_length, tol)
+   const real_t on_gamma = std::sqrt(BisectionResolution(x, search_length)
                                      * search_length);
    const real_t ds = std::sqrt(eps) * search_length;
 
@@ -545,7 +816,7 @@ bool VertexConePath::VertexDirection(const Vector &x,
          const real_t len = t.Norml2();
          if (len <= 0.) { continue; }
          t /= len;
-         if (pass > 0) { n_widened++; }
+         if (pass > 0) { counts[0]++; }
          return true;
       }
 
@@ -561,7 +832,7 @@ bool VertexConePath::VertexDirection(const Vector &x,
       }
       if (hits.empty()) { continue; }
 
-      if (pass > 0) { n_widened++; }
+      if (pass > 0) { counts[0]++; }
 
       std::sort(hits.begin(), hits.end(),
                 [](const std::pair<real_t, std::array<real_t, 2>> &a,
@@ -602,8 +873,9 @@ void VertexConePath::Endpoint(const Vector &x, const Vector &n,
               "normal would reintroduce the two failures this family repairs.");
 }
 
-void VertexConePath::Endpoint(FaceElementTransformations &FTr,
-                              const IntegrationPoint &ip, Vector &xbar) const
+void VertexConePath::FaceDirection(FaceElementTransformations &FTr,
+                                   const IntegrationPoint &ip, Vector &t,
+                                   DenseMatrix *dt) const
 {
    const int f = (FTr.ElementType == ElementTransformation::BDR_FACE)
                  ? mesh->GetBdrElementFaceIndex(FTr.ElementNo)
@@ -613,13 +885,31 @@ void VertexConePath::Endpoint(FaceElementTransformations &FTr,
                "the family was constructed for");
 
    const real_t th = ip.x;
-   Vector t(2);
+   t.SetSize(2);
    t(0) = (1. - th) * tang[4 * f + 0] + th * tang[4 * f + 2];
    t(1) = (1. - th) * tang[4 * f + 1] + th * tang[4 * f + 3];
    const real_t len = t.Norml2();
    MFEM_VERIFY(len > 1e-12, "the paths of the two vertices of a face oppose "
                "each other, so no direction can be interpolated between them");
    t /= len;
+
+   if (dt)
+   {
+      // t = u/|u| with u linear in th: t' = (u' - t (t . u'))/|u|.
+      const real_t du0 = tang[4 * f + 2] - tang[4 * f + 0];
+      const real_t du1 = tang[4 * f + 3] - tang[4 * f + 1];
+      const real_t tdu = t(0) * du0 + t(1) * du1;
+      dt->SetSize(2, 1);
+      (*dt)(0, 0) = (du0 - tdu * t(0)) / len;
+      (*dt)(1, 0) = (du1 - tdu * t(1)) / len;
+   }
+}
+
+void VertexConePath::Endpoint(FaceElementTransformations &FTr,
+                              const IntegrationPoint &ip, Vector &xbar) const
+{
+   Vector t;
+   FaceDirection(FTr, ip, t, nullptr);
 
    Vector x(2);
    FTr.SetAllIntPoints(&ip);
@@ -636,6 +926,33 @@ void VertexConePath::Endpoint(FaceElementTransformations &FTr,
    xbar(1) = x(1) + s * t(1);
 }
 
+bool VertexConePath::EndpointJacobian(FaceElementTransformations &FTr,
+                                      const IntegrationPoint &ip,
+                                      DenseMatrix &dadxi) const
+{
+   if (!grad_phi) { return false; }
+
+   Vector t;
+   DenseMatrix dt;
+   FaceDirection(FTr, ip, t, &dt);
+
+   Vector x(2), xbar(2);
+   FTr.SetAllIntPoints(&ip);
+   FTr.Transform(ip, x);
+   const DenseMatrix dx(FTr.Jacobian());
+   real_t s;
+   MFEM_VERIFY(FirstCrossing(phi, x, t, search_length, search_steps, tol,
+                             max_iter, s),
+               "the interpolated path from a point of Gamma_h never meets "
+               "Gamma within the search length " << search_length);
+   xbar(0) = x(0) + s * t(0);
+   xbar(1) = x(1) + s * t(1);
+
+   RayEndpointJacobian(grad_phi, xbar, t, s, dx, dt,
+                       FTr.ElementNo, dadxi);
+   return true;
+}
+
 TiltedPath::TiltedPath(const TransferPath &base_, PositionFunction phi_,
                        real_t gamma_, real_t search_length_, int search_steps_,
                        real_t tol_, int max_iter_)
@@ -647,9 +964,9 @@ TiltedPath::TiltedPath(const TransferPath &base_, PositionFunction phi_,
                "(0, 1), not " << gamma);
 }
 
-bool TiltedPath::Tilt(const Vector &x, const Vector &n, Vector &xbar) const
+bool TiltedPath::TiltDirection(const Vector &x, const Vector &n,
+                               const Vector &xbar, Vector &t) const
 {
-   const int dim = x.Size();
    Vector m(xbar);
    m -= x;
    const real_t L = m.Norml2();
@@ -664,12 +981,20 @@ bool TiltedPath::Tilt(const Vector &x, const Vector &n, Vector &xbar) const
    Vector w(m);
    w.Add(-c, n);
    const real_t wn = w.Norml2();
-   Vector t(n);
+   t = n;
    if (wn > 0.)
    {
       t *= gamma;
       t.Add(std::sqrt(1. - gamma * gamma) / wn, w);
    }
+   return true;
+}
+
+bool TiltedPath::Tilt(const Vector &x, const Vector &n, Vector &xbar) const
+{
+   const int dim = x.Size();
+   Vector t;
+   if (!TiltDirection(x, n, xbar, t)) { return false; }
 
    real_t s;
    MFEM_VERIFY(FirstCrossing(phi, x, t, search_length, search_steps, tol,
@@ -725,11 +1050,76 @@ bool TiltedPath::EndpointJacobian(FaceElementTransformations &FTr,
                                   const IntegrationPoint &ip,
                                   DenseMatrix &dadxi) const
 {
-   Vector x, nor, xbar;
+   Vector x, nor, xbar, t;
    FacePointAndNormal(FTr, ip, x, nor);
    base.Endpoint(FTr, ip, xbar);
-   if (Tilt(x, nor, xbar)) { return false; }
-   return base.EndpointJacobian(FTr, ip, dadxi);
+   if (!TiltDirection(x, nor, xbar, t))
+   {
+      return base.EndpointJacobian(FTr, ip, dadxi);
+   }
+
+   // Tilted. t is built from the wrapped path's direction m and the face
+   // normal n, so t' needs the wrapped endpoint's derivative and n'.
+   const int sdim = FTr.GetSpaceDim(), fdim = sdim - 1;
+   if (!grad_phi || fdim < 1) { return false; }
+   DenseMatrix dab;
+   if (!base.EndpointJacobian(FTr, ip, dab)) { return false; }
+
+   FTr.SetAllIntPoints(&ip);
+   Vector n;
+   DenseMatrix dn;
+   FaceNormalDerivative(FTr, n, dn);
+   const DenseMatrix dx(FTr.Jacobian());
+
+   Vector m(xbar);
+   m -= x;
+   const real_t L = m.Norml2();
+   m /= L;
+   const real_t c = m * n;
+   Vector w(m);
+   w.Add(-c, n);
+   const real_t wn = w.Norml2();
+   const real_t sg = std::sqrt(1. - gamma * gamma);
+
+   DenseMatrix dt(sdim, fdim);
+   Vector dm(sdim), dw(sdim);
+   for (int k = 0; k < fdim; k++)
+   {
+      // m = (a_b - x)/L: m' = (r' - m (m . r'))/L with r' = a_b' - x'.
+      for (int d = 0; d < sdim; d++) { dm(d) = dab(d, k) - dx(d, k); }
+      const real_t mr = m * dm;
+      for (int d = 0; d < sdim; d++) { dm(d) = (dm(d) - mr * m(d)) / L; }
+      if (wn == 0.)
+      {
+         for (int d = 0; d < sdim; d++) { dt(d, k) = dn(d, k); }
+         continue;
+      }
+      // c = m . n, w = m - c n, t = gamma n + sg w/|w|.
+      real_t dc = dm * n;
+      for (int d = 0; d < sdim; d++) { dc += m(d) * dn(d, k); }
+      for (int d = 0; d < sdim; d++)
+      {
+         dw(d) = dm(d) - dc * n(d) - c * dn(d, k);
+      }
+      real_t wdw = 0.;
+      for (int d = 0; d < sdim; d++) { wdw += w(d) * dw(d); }
+      wdw /= wn;
+      for (int d = 0; d < sdim; d++)
+      {
+         dt(d, k) = gamma * dn(d, k) + sg * (dw(d) - wdw * w(d) / wn) / wn;
+      }
+   }
+
+   real_t s;
+   MFEM_VERIFY(FirstCrossing(phi, x, t, search_length, search_steps, tol,
+                             max_iter, s),
+               "TiltedPath: the tilted ray never meets the level set within "
+               "the search length " << search_length);
+   Vector a(x);
+   a.Add(s, t);
+   RayEndpointJacobian(grad_phi, a, t, s, dx, dt, FTr.ElementNo,
+                       dadxi);
+   return true;
 }
 
 ElementExtension::ElementExtension()
@@ -1196,13 +1586,17 @@ void ExtensionRegionQuadrature(
       // mesh -- has neither, and the region is the path itself.
       if (fdim > 0) { dxdxi = FTr.Jacobian(); }
 
-      for (int i = 0; i < fdim; i++)
+      // The family's own derivative where it has one, as
+      // ExtensionBoundaryQuadrature() asks; the difference otherwise.
+      const bool analytic = fdim > 0 && path.EndpointJacobian(FTr, ip, dadxi);
+      for (int i = 0; i < fdim && !analytic; i++)
       {
          FaceEndpointDerivative(FTr, path, ip, xbar, i, fd_step,
                                 xbar_p, xbar_m, da);
          for (int d = 0; d < sdim; d++) { dadxi(d, i) = da(d); }
       }
-      // Endpoint() moved the transformations; put them back.
+      // Endpoint() -- or EndpointJacobian() -- moved the transformations; put
+      // them back.
       FTr.SetAllIntPoints(&ip);
 
       // THE WEIGHT IS SIGNED, FOR THE REASON ExtensionBoundaryQuadrature() IS.
@@ -1428,7 +1822,8 @@ void ExtensionBoundaryQuadrature(
 }
 
 int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
-                          real_t offset, Array<int> &marker, int extra_refine)
+                          real_t offset, Array<int> &marker, int extra_refine,
+                          bool phi_thread_safe)
 {
    const int NE = mesh.GetNE();
    const int sdim = mesh.SpaceDimension();
@@ -1436,37 +1831,73 @@ int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
    marker.SetSize(NE);
    marker = 0;
 
-   Array<int> vert;
-   Vector x(sdim);
-   IsoparametricTransformation Tr;
-   int count = 0;
-
-   for (int i = 0; i < NE; i++)
+   // The sampling lattices, one per element geometry, refined BEFORE the loop.
+   // GeometryRefiner::Refine() is a critical section in a thread-safe build
+   // and a race in any other, and its answer depends on the geometry alone,
+   // so there is nothing to refine per element.
+   std::array<RefinedGeometry*, Geometry::NUM_GEOMETRIES> lattice{};
+   if (extra_refine >= 1)
    {
-      bool inside = true;
-
-      mesh.GetElementVertices(i, vert);
-      for (int v = 0; v < vert.Size() && inside; v++)
+      for (int g = 0; g < Geometry::NUM_GEOMETRIES; g++)
       {
-         const real_t *c = mesh.GetVertex(vert[v]);
-         for (int d = 0; d < sdim; d++) { x(d) = c[d]; }
-         if (phi(x) > -offset) { inside = false; }
-      }
-
-      if (inside && extra_refine >= 1)
-      {
-         RefinedGeometry *RefG =
-            GlobGeometryRefiner.Refine(mesh.GetElementGeometry(i), extra_refine);
-         mesh.GetElementTransformation(i, &Tr);
-         for (int q = 0; q < RefG->RefPts.GetNPoints() && inside; q++)
+         const Geometry::Type gt = Geometry::Type(g);
+         if (Geometry::Dimension[g] == mesh.Dimension() && mesh.HasGeometry(gt))
          {
-            Tr.Transform(RefG->RefPts.IntPoint(q), x);
-            if (phi(x) > -offset) { inside = false; }
+            lattice[g] = GlobGeometryRefiner.Refine(gt, extra_refine);
          }
       }
-
-      if (inside) { marker[i] = 1; count++; }
    }
+
+   const bool threaded =
+      LevelSetLoopsThread(mesh, phi_thread_safe, extra_refine >= 1);
+   (void)threaded;   // read only by the pragma
+   int count = 0;
+   LevelSetLoopTrap trap;
+
+   // Every element is decided alone and writes only its own marker, so the
+   // threaded loop is the serial one with its iterations reordered.
+#ifdef MFEM_USE_OPENMP
+   #pragma omp parallel if (threaded) reduction(+:count)
+#endif
+   {
+      Array<int> vert;
+      Vector x(sdim);
+      IsoparametricTransformation Tr;
+
+#ifdef MFEM_USE_OPENMP
+      #pragma omp for schedule(static)
+#endif
+      for (int i = 0; i < NE; i++)
+      {
+         try
+         {
+            bool inside = true;
+
+            mesh.GetElementVertices(i, vert);
+            for (int v = 0; v < vert.Size() && inside; v++)
+            {
+               const real_t *c = mesh.GetVertex(vert[v]);
+               for (int d = 0; d < sdim; d++) { x(d) = c[d]; }
+               if (phi(x) > -offset) { inside = false; }
+            }
+
+            if (inside && extra_refine >= 1)
+            {
+               RefinedGeometry *RefG = lattice[mesh.GetElementGeometry(i)];
+               mesh.GetElementTransformation(i, &Tr);
+               for (int q = 0; q < RefG->RefPts.GetNPoints() && inside; q++)
+               {
+                  Tr.Transform(RefG->RefPts.IntPoint(q), x);
+                  if (phi(x) > -offset) { inside = false; }
+               }
+            }
+
+            if (inside) { marker[i] = 1; count++; }
+         }
+         catch (...) { trap.Capture(); }
+      }
+   }
+   trap.Rethrow();
 
    return count;
 }
@@ -1475,9 +1906,11 @@ int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
 int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
                           real_t offset, Array<int> &marker,
                           const TransferPath &path, real_t min_cos,
-                          int extra_refine, int max_sweeps)
+                          int extra_refine, int max_sweeps,
+                          bool phi_thread_safe)
 {
-   int count = MarkLevelSetSubdomain(mesh, phi, offset, marker, extra_refine);
+   int count = MarkLevelSetSubdomain(mesh, phi, offset, marker, extra_refine,
+                                     phi_thread_safe);
    const int sdim = mesh.SpaceDimension();
    if (sdim == 1 || mesh.Dimension() != sdim) { return count; }
 
@@ -1524,6 +1957,45 @@ int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
       }
    }
    return count;
+}
+
+PathIncidenceReport CheckPathIncidence(Mesh &D_h, int gamma_h_attr,
+                                       const TransferPath &path,
+                                       const VectorPositionFunction &grad_phi,
+                                       real_t threshold, int order)
+{
+   PathIncidenceReport r;
+   Vector x, nor, xbar, m, g;
+   for (int be = 0; be < D_h.GetNBE(); be++)
+   {
+      if (D_h.GetBdrAttribute(be) != gamma_h_attr) { continue; }
+      FaceElementTransformations *FTr = D_h.GetBdrFaceTransformations(be);
+      if (!FTr) { continue; }
+      const IntegrationRule &ir = IntRules.Get(FTr->GetGeometryType(), order);
+      bool face_below = false;
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         FacePointAndNormal(*FTr, ip, x, nor);
+         path.Endpoint(*FTr, ip, xbar);
+         m = xbar;
+         m -= x;
+         const real_t L = m.Norml2();
+         if (L == 0.) { continue; }
+         g.SetSize(x.Size());
+         grad_phi(xbar, g);
+         const real_t gn = g.Norml2();
+         // A gradient that vanishes or is not finite has no incidence; it is
+         // as bad as a tangent ray, and counts as one.
+         const real_t c = (gn > 0. && g.CheckFinite() == 0)
+                          ? (m * g) / (L * gn) : 0.;
+         r.points++;
+         if (c < threshold) { r.below++; face_below = true; }
+         if (c < r.min_cos) { r.min_cos = c; r.worst_bdr = be; }
+      }
+      if (face_below) { r.faces_below++; }
+   }
+   return r;
 }
 
 PathAngleReport CheckPathAngles(Mesh &D_h, int gamma_h_attr,

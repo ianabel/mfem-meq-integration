@@ -223,6 +223,35 @@ public:
                               Vector &elvect) override;
 };
 
+/** @brief A stabilization written as data, so that a kernel can evaluate it:
+    $s(x) = c_0$, or $s(x) = c_0 / \max(x_k, x_f)$ at the physical point $x$.
+
+    The second form is the diffusion-scaled $\tau = \tau_0 / \ell$ of Nguyen,
+    Peraire and Cockburn with $\kappa = 1/x_k$, floored: in an axisymmetric
+    problem posed in $(R, z)$ the flux equation carries $R$ and the
+    stabilization that matches it is $\tau_0/R$, kept finite at the axis by the
+    floor. These are the two stabilizations meq runs, and the reason this
+    exists: an HDGStabilization is a host virtual taking an
+    ElementTransformation, so a batched route that has to call it evaluates
+    every face weight on the host. One that describes itself through
+    HDGStabilization::GetRule() is evaluated on the device instead, at the
+    physical point the element's map gives (see HDGFaceWeightsOnDevice()). */
+struct HDGStabilizationRule
+{
+   real_t c0 = 0.0;     ///< the constant, or the numerator
+   int coord = -1;      ///< k, the coordinate; negative for the constant c0
+   real_t floor = 0.0;  ///< x_f, the floor on x_k
+
+   /// $s$ at the physical point @a x, which has at least coord + 1 entries.
+   MFEM_HOST_DEVICE real_t Eval(const real_t *x) const
+   {
+      if (coord < 0) { return c0; }
+      // std::max(x_k, x_f) exactly, NaN included.
+      const real_t r = (x[coord] < floor) ? floor : x[coord];
+      return c0 / r;
+   }
+};
+
 /** @brief Stabilization function of the HDG numerical flux,
     $$
        \hat q_h + \hat F_h = q_h + F(\hat u_h)
@@ -266,8 +295,25 @@ public:
    virtual ~HDGStabilization() { }
 
    /** @brief True when $s$ depends on neither the potential nor its trace.
-       The default is the constant case. */
+       The default is the constant case.
+
+       A statement about the STATE, not about position: an $s$ that varies
+       from point to point and not with the solution is constant here. */
    virtual bool IsConstant() const { return true; }
+
+   /** @brief Describe Eval() as an HDGStabilizationRule, or decline.
+
+       Return true only when Eval() IS @a rule: for every argument it returns
+       `rule.Eval(x)` at the physical point `x` of the transformation it is
+       handed, and reads neither `s_diff`, `un`, `u` nor `uhat`. The batched
+       face routes then weigh their points on the device and never call
+       Eval(). Nothing checks the claim, so a class that makes it should
+       evaluate Eval() through HDGStabilizationRule::Eval() as
+       HDGRuleStabilization does. The default declines, and the batched routes
+       call Eval() on the host as before. Consulted only when IsConstant() is
+       true. */
+   virtual bool GetRule(HDGStabilizationRule &rule) const
+   { MFEM_CONTRACT_VAR(rule); return false; }
 
    /** @brief The stabilization at one quadrature point.
        @param s_diff the value the integrator forms on its own, that is the
@@ -437,6 +483,23 @@ public:
    }
 };
 
+/** @brief The HDGStabilization an HDGStabilizationRule describes: Eval() is
+    the rule at the transformation's physical point, and GetRule() says so.
+
+    Thread safe: the point is held on the stack. */
+class HDGRuleStabilization : public HDGStabilization
+{
+   HDGStabilizationRule rule;
+
+public:
+   explicit HDGRuleStabilization(const HDGStabilizationRule &r) : rule(r) { }
+
+   real_t Eval(real_t s_diff, real_t un, real_t u, real_t uhat,
+               ElementTransformation &Tr) const override;
+
+   bool GetRule(HDGStabilizationRule &r) const override { r = rule; return true; }
+};
+
 /** @brief Batched, device-capable assembly of HDGDiffusionIntegrator's
     INTERIOR-face matrices: every face's matrix in one mfem::forall instead of
     one host call per face.
@@ -496,6 +559,12 @@ void HDGDiffusionFaceMatricesBatched(const FiniteElementSpace &tr_fes,
           DarcyHybridization::SetAssemblyMode().
     @note @a Df_data is added to and must be zeroed by the caller;
           @a E_data, @a G_data and @a H_data are overwritten.
+    @note The per-point weights of an HDGDiffusionIntegrator are computed on
+          the device wherever HDGFaceWeightsOnDevice() admits it, and the
+          element shapes are read from one table per (local face,
+          orientation) slot, so on that route nothing runs per face on the
+          host but a gather of the face and element point matrices. The
+          convection forms read a velocity coefficient and stay on the host.
 
     @note MEASURED, and the atomics are why this is a DEVICE path and not a
           host one. Correct either way -- E, G and H come out bit-exact
@@ -656,12 +725,133 @@ void HDGFaceScatterBatched(const FiniteElementSpace &tr_fes,
                            Vector &E_data, Vector &G_data,
                            Vector &H_data, Vector &Df_data);
 
-/** @brief Whether HDGBdrFaceScatterBatched() can take @a integs.
+/** @brief Every element's Jacobians and determinants at the points of one
+    rule, laid out as GeometricFactors lays them out, WITHOUT adding nodes to
+    the mesh.
 
-    The same question HDGFaceScatterCanBatch() asks, on boundary faces --
-    including the vdim > 1 resolution into one scalar integrator per equation.
-    The face lists are per integrator because a boundary integrator carries an
-    attribute marker and two of them need not apply to the same faces. */
+    Mesh::GetGeometricFactors() calls Mesh::EnsureNodes() on a mesh that has
+    none. A batched kernel that took its geometry from it therefore changed
+    the CALLER'S mesh partway through an assembly that the per-element route
+    performs without touching it, and changed every later computation that
+    asks whether the mesh has nodes. That later computation is where it shows,
+    not in the geometry. Measured on meq's mirror mesh (1,175 triangles), every
+    element's Jacobian, weight and mapped point, and every face's normal,
+    weight and element points, are bit-identical with and without the nodes.
+    Mesh::FindPoints() is not identical: its reference coordinates move by up
+    to 1.8e-15. In meq's free-boundary mirror solve, adding the nodes and
+    nothing else, ahead of the per-element divergence route, moved psi_h by
+    9.06e-10 of its largest value. That run's batched-against-serial
+    comparison had read 6.8e-13. Its fixed-boundary tokamak, with no
+    extension, did not move.
+
+    On a mesh with nodes this is Mesh::GetGeometricFactors(), cache and all.
+    On a mesh without them, each element's vertices are mapped through its
+    geometry's linear transformation element, which is what
+    Mesh::GetElementTransformation() does there. The arithmetic is in the same
+    order: J = PointMat * DShape summed over the vertices in order, and the
+    determinant as DenseMatrix::Weight() takes it. One element geometry only. */
+class HDGElementGeometry
+{
+public:
+   /// @a flags as GeometricFactors takes them: JACOBIANS, DETERMINANTS or both.
+   HDGElementGeometry(Mesh &mesh, const IntegrationRule &ir, int flags);
+
+   /// NQ x SDIM x DIM x NE, as GeometricFactors::J.
+   const Vector &J() const { return gf ? gf->J : J_; }
+   /// NQ x NE, as GeometricFactors::detJ.
+   const Vector &DetJ() const { return gf ? gf->detJ : detJ_; }
+
+private:
+   const GeometricFactors *gf = nullptr;
+   Vector J_, detJ_;
+};
+
+/** @brief Whether HDGElementPointsAndWeights() can take @a mesh: one element
+    geometry, not NURBS, and no nodes or nodes of one order. */
+bool HDGElementPointsOnDevice(const Mesh &mesh);
+
+/** @brief Every element's physical points and quadrature weights at the
+    points of @a ir, computed on the device from the elements' point matrices:
+    @a X is (SDIM, NQ, NE) and @a W is (NQ, NE), ip.weight times the
+    Jacobian's weight.
+
+    This is what a host loop over Mesh::GetElementTransformation() gets from
+    Transform() and Weight(), summed in IsoparametricTransformation's order,
+    so on the host the two agree bit for bit. No ElementTransformation is
+    built, and no nodes are added to the mesh. The point matrices are
+    gathered on the host, one copy per entry. Requires
+    HDGElementPointsOnDevice(). */
+void HDGElementPointsAndWeights(const Mesh &mesh, const IntegrationRule &ir,
+                                Vector &X, Vector &W);
+
+class HDGDiffusionIntegrator;
+
+/** @brief Whether a coefficient can be evaluated on the device at any points
+    of the elements of @a mesh, with no host loop and no ElementTransformation.
+
+    True for a ConstantCoefficient, and for a GridFunctionCoefficient whose
+    GridFunction lives on @a mesh itself, in a space of one order on a mesh of
+    one element geometry, with VALUE-mapped scalar elements -- H1 and L2 at
+    any vector dimension, its component taken as the coefficient asks. The
+    function is gathered by the space's ElementRestriction, so it is READ ON
+    THE DEVICE, and evaluated against one shape table per set of reference
+    points.
+
+    That last condition is what makes an axisymmetric radius cheap: on an
+    affine mesh $R$ is linear on every element, so a GridFunctionCoefficient
+    of the degree-1 coordinate field, component 1, is $R$ exactly at any
+    point. Exactly in exact arithmetic, that is, and not bit for bit: a
+    degree-1 H1_FECollection triangle is H1_TriangleElement, which goes
+    through an inverse Vandermonde matrix where the mesh's own transformation
+    uses Linear2DFiniteElement's 1 - x - y. meq saw the two differ at the ulp
+    in single precision.
+
+    This is not CoefficientVector, which would evaluate a
+    GridFunctionCoefficient through QuadratureInterpolator on the device for
+    elements, and it is worth saying why: GridFunctionCoefficient::Project()
+    projects EVERY component of its GridFunction and ignores the one it was
+    built for, so a coordinate component came back as the whole interleaved
+    coordinate field. Faces would also have needed a FaceQuadratureSpace in
+    its own face order. One shape table per (local face, orientation) slot
+    serves faces here in the order the face kernels already hold. */
+bool HDGCoefficientOnDevice(Coefficient *Q, const Mesh &mesh);
+
+/** @brief Whether the batched face routes -- HDGFaceScatterBatched(),
+    HDGBdrFaceScatterBatched() and HDGFaceSideBatched() -- weigh @a dif's face
+    term on the DEVICE.
+
+    The weight of a point is the integrator's StabValue(), and it needs the
+    face normal, the element's Jacobian determinant at the point, and either
+    the coefficient there (the built-in stabilization) or the HDGStabilization
+    (a user's). All of it is taken on the device from point matrices: the
+    normal from the face's own vertices (or node dofs), the determinant and
+    the physical point from the element's at the face's reference points in
+    that element, each summed in the order IsoparametricTransformation sums
+    it. So nothing builds a transformation per face, and on the host the
+    weights are the per-face loop's own bits. That needs:
+
+    - no velocity and no matrix coefficient on @a dif;
+    - either no HDGStabilization, and a coefficient HDGCoefficientOnDevice()
+      takes (or none), or a state-independent one that describes itself
+      through HDGStabilization::GetRule(). With a rule the coefficient is not
+      read at all, since the rule does not read `s_diff`;
+    - a mesh of dimension 2 or 3 equal to its space dimension, of one element
+      geometry other than a prism or a pyramid (one face geometry), without
+      nodes or with continuous nodes of one order -- the meshes on which
+      Mesh::GetFaceTransformation() reads a face's own points.
+
+    Otherwise the weights are taken on the host as before, one
+    ElementTransformation per face. */
+bool HDGFaceWeightsOnDevice(const HDGDiffusionIntegrator &dif,
+                            const FiniteElementSpace &el_fes);
+
+/** @brief Whether HDGElementMassBatched() weighs @a bfi's points on the
+    device: no coefficient, or a scalar one HDGCoefficientOnDevice() takes,
+    with the determinants from HDGElementGeometry. A vector or matrix
+    coefficient, or any other scalar one, is evaluated on the host. */
+bool HDGElementMassOnDevice(const BilinearFormIntegrator &bfi,
+                            const FiniteElementSpace &fes);
+
 /** @brief Whether HDGElementMassBatched() can take @a integs on @a fes.
 
     Every integrator has to be a MassIntegrator or a VectorMassIntegrator --
@@ -792,6 +982,12 @@ void HDGMixedConductionResidualBatched(const FiniteElementSpace &fes,
                                        BlockNonlinearFormIntegrator *integ,
                                        const Vector &u_all, Vector &ru_all);
 
+/** @brief Whether HDGBdrFaceScatterBatched() can take @a integs.
+
+    The same question HDGFaceScatterCanBatch() asks, on boundary faces --
+    including the vdim > 1 resolution into one scalar integrator per equation.
+    The face lists are per integrator because a boundary integrator carries an
+    attribute marker and two of them need not apply to the same faces. */
 bool HDGBdrFaceScatterCanBatch(const FiniteElementSpace &tr_fes,
                                const FiniteElementSpace &el_fes,
                                const Array<BilinearFormIntegrator*> &integs,
@@ -812,7 +1008,11 @@ bool HDGBdrFaceScatterCanBatch(const FiniteElementSpace &tr_fes,
     @a face_lists gives, per integrator, the faces its attribute marker
     admits; @a all_faces is their union and is what gets zeroed first. E, G
     and H are assigned by the per-face route (CopyMN), so zero-then-accumulate
-    reproduces it; D accumulates there and here. */
+    reproduces it; D accumulates there and here.
+
+    The weights are on the device as HDGFaceScatterBatched()'s are, under
+    HDGFaceWeightsOnDevice(), with the shapes from one table per slot when
+    the elements are VALUE-mapped. */
 void HDGBdrFaceScatterBatched(const FiniteElementSpace &tr_fes,
                               const FiniteElementSpace &el_fes,
                               const Array<BilinearFormIntegrator*> &integs,
@@ -940,6 +1140,93 @@ bool HDGFaceSpacesCanBatch(const FiniteElementSpace &tr_fes,
     integrators. */
 bool HDGDiffusionFaceMatricesCanBatch(const FiniteElementSpace &tr_fes,
                                       const FiniteElementSpace &el_fes);
+
+/** @brief Whether HDGNormalTraceJumpBatched() can take @a bfi on these spaces.
+
+    @a bfi has to be a NormalTraceJumpIntegrator itself (not a wrapper of one)
+    on a discontinuous SCALAR-range flux space of vdim == dim, VALUE-mapped,
+    against a scalar DG_Interface trace. The mesh has to be conforming, of one
+    element geometry and one order, with nodes (if any) of one order -- which
+    is what makes one integration rule and one shape table per (local face,
+    orientation) slot serve every face. All of it is asked of the spaces and
+    the mesh, not face by face, so it costs no transformation. */
+bool HDGNormalTraceJumpCanBatch(const FiniteElementSpace &tr_fes,
+                                const FiniteElementSpace &el_fes,
+                                const BilinearFormIntegrator *bfi);
+
+/** @brief NormalTraceJumpIntegrator's face block, ONE SIDE AT A TIME, for
+    every (face, side) pair in (@a faces, @a sides), in one mfem::forall.
+
+    Item k's block is the rows AssembleFaceMatrix() gives side @a sides[k] of
+    face @a faces[k]: (ND*dim x TRD), column-major, row `i + d*ND` for
+    component d of element dof i, side 2's rows already carrying the
+    integrator's minus sign. So an interior face's two items, stacked, are the
+    integrator's whole element matrix, and a boundary face (side 0 only) is
+    what it returns with Elem2No < 0.
+
+    The arithmetic is the integrator's own, in its order -- the trace shape
+    scaled by `ip.weight * sign` first, then `shape * face_shape * normal` --
+    so on the host the blocks agree with it to the last bit wherever the
+    compiler does not contract to an FMA.
+
+    The element shapes at the face points come from one table per (local
+    face, orientation) slot, which needs VALUE-mapped elements. The normals
+    are taken on the DEVICE from each face's own point matrix, in
+    EvalJacobian()'s order, wherever the mesh's faces are its vertices or its
+    continuous nodes (see HDGFaceWeightsOnDevice() for the conditions), so
+    the bits are the face transformation's. Otherwise -- discontinuous nodes,
+    a prism or pyramid mesh -- they are taken on the host, one face
+    transformation per face. Not Mesh::GetFaceGeometricFactors(), which
+    segfaults on a simplex mesh.
+
+    One-sided rather than two-sided because both callers want sides
+    separately: DarcyHybridization::ConstructC() stores the two sides of a
+    face in separate compacted blocks, and the rich reconstruction's local
+    problem takes one element's side of each of its faces. */
+void HDGNormalTraceJumpBatched(const FiniteElementSpace &tr_fes,
+                               const FiniteElementSpace &el_fes,
+                               const BilinearFormIntegrator &bfi,
+                               const Array<int> &faces,
+                               const Array<int> &sides,
+                               Vector &blocks);
+
+/** @brief Whether HDGFaceSideBatched() can take @a integs.
+
+    Every integrator has to be an HDGDiffusionIntegrator with a constant (or
+    no) HDGStabilization, on scalar spaces (vdim == 1), and the spaces have to
+    pass the same uniformity tests as HDGNormalTraceJumpCanBatch(). The
+    convection forms are refused: their one-sided matrix is the base class's
+    halving of the two-sided one, which is not what this kernel computes. */
+bool HDGFaceSideCanBatch(const FiniteElementSpace &tr_fes,
+                         const FiniteElementSpace &el_fes,
+                         const Array<BilinearFormIntegrator*> &integs);
+
+/** @brief The ONE-SIDED HDG face matrix of every integrator in @a integs,
+    summed, for every (face, side) item, in one mfem::forall.
+
+    Item k's block is what `AssembleHDGFaceMatrix(sides[k], tr_fe, el_fe,
+    Trans, elmat)` returns for face @a faces[k] -- (ND + TRD) square,
+    column-major, the element block first:
+
+        [ D  E ]     D =  w s s^T,  E = -w s t^T,
+        [ G  H ]     G =  w t s^T,  H = -w t t^T,
+
+    with one weight w per quadrature point, which is the integrator's
+    StabValue() at that side's own coefficient and that side's outward
+    normal. D and H are accumulated over their lower triangle and mirrored,
+    as the integrator does, so the products are associated the same way.
+
+    The weights are evaluated on the DEVICE wherever HDGFaceWeightsOnDevice()
+    admits the integrator, and otherwise on the host, through
+    Coefficient::Eval() and the HDGStabilization hook, which are host virtuals
+    taking an ElementTransformation. The outer products, which are the
+    O(NQ (ND+TRD)^2) part, are the kernel's either way. */
+void HDGFaceSideBatched(const FiniteElementSpace &tr_fes,
+                        const FiniteElementSpace &el_fes,
+                        const Array<BilinearFormIntegrator*> &integs,
+                        const Array<int> &faces,
+                        const Array<int> &sides,
+                        Vector &blocks);
 
 /** Integrator for the H/LDG diffusion stabilization term
     The LDG stabilization takes the form

@@ -1279,3 +1279,223 @@ TEST_CASE("Reconstruction runs under a constrained trace and is the coarse one",
    // And the reconstruction is a different, richer postprocessing of it.
    REQUIRE(MaxDiff(a.u_s, b.u_s) > 1e-6);
 }
+
+namespace darcy_reconstruction_batched
+{
+
+using namespace darcy_reconstruction;
+
+/// Which potential form carries the constraint, and whether a domain term
+/// rides on the nonlinear one -- meq's shape: a source on Mnl_p that the
+/// local problem does not lift, beside a linear face constraint that
+/// EnableHybridization() moves to the linear route.
+enum class Shape { Linear, NonlinearWithSource };
+
+struct Both
+{
+   Vector ut[2], u_s[2], p_s[2], tr_s[2];
+   bool ut_taken = false, fp_taken = false;
+};
+
+/// Solve ONCE, then reconstruct twice from the same solution -- per element
+/// (AssemblyMode::Serial) and batched -- so that the two differ in the
+/// reconstruction and in nothing else.
+void SolveAndReconstruct(Mesh &mesh, int order, Shape shape, Both &out)
+{
+   const int dim = mesh.Dimension();
+   L2_FECollection u_coll(order, dim);
+   L2_FECollection p_coll(order, dim);
+   FiniteElementSpace fes_u(&mesh, &u_coll, dim);
+   FiniteElementSpace fes_p(&mesh, &p_coll);
+
+   // meq's flux mass: R, a coordinate, as a FunctionCoefficient.
+   FunctionCoefficient R([](const Vector &x) { return 1.0 + x(0); });
+   ConstantCoefficient small(0.25);
+   FunctionCoefficient gcoeff(gExact);
+
+   DarcyForm darcy(&fes_u, &fes_p);
+   darcy.GetFluxMassForm()->AddDomainIntegrator(new VectorMassIntegrator(R));
+   MixedBilinearForm *B = darcy.GetFluxDivForm();
+   B->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   B->AddInteriorFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-1.0)));
+   Array<int> bdr(mesh.bdr_attributes.Max());
+   bdr = 1;
+   B->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-2.0)), bdr);
+
+   if (shape == Shape::Linear)
+   {
+      BilinearForm *M_p = darcy.GetPotentialMassForm();
+      M_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(R, 2.0));
+      M_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(R, 2.0), bdr);
+   }
+   else
+   {
+      NonlinearForm *Mnl_p = darcy.GetPotentialMassNonlinearForm();
+      Mnl_p->AddDomainIntegrator(new MassIntegrator(small));
+      Mnl_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(R, 2.0));
+      Mnl_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(R, 2.0), bdr);
+   }
+   darcy.GetPotentialRHS()->AddDomainIntegrator(
+      new DomainLFIntegrator(gcoeff, 6, 12));
+
+   Array<int> ess;
+   DG_Interface_FECollection trace_coll(order, dim);
+   FiniteElementSpace fes_t(&mesh, &trace_coll);
+   darcy.EnableHybridization(&fes_t, new NormalTraceJumpIntegrator(), ess);
+   DarcyHybridization *dh = darcy.GetHybridization();
+   // As meq does. Without it, B's boundary face integrator puts a ZERO-FLUX
+   // constraint on every boundary face, and with no trace datum anywhere the
+   // GLOBAL problem is a pure Neumann one whose source does not integrate to
+   // zero: singular, and with no solution. Measured at k = 0, 3x3 triangles:
+   // UMFPack's rcond is 2e-15 and it returns |p_h| = 2.4e15 with a residual
+   // of 2.6, without failing. Both reconstructions then post-process that
+   // faithfully -- each element's local matrix is the same, condition about
+   // 4e2, either way, and the 1e15 arrives through the closure's element
+   // average -- so the comparison would be between two answers to nothing.
+   //
+   // An earlier version of this note blamed the reconstruction's local
+   // problems for being singular. They are not; the solve was.
+   dh->SetEssentialBC(bdr);
+   darcy.Assemble();
+
+   BlockVector x(darcy.GetOffsets());
+   x = 0.0;
+   OperatorPtr A;
+   Vector X, RHS;
+   darcy.FormLinearSystem(ess, x, A, X, RHS, true);
+
+   GSSmoother prec;
+   GMRESSolver lin;
+   lin.SetKDim(500);
+   lin.SetMaxIter(5000);
+   lin.SetRelTol(1e-14);
+   lin.SetAbsTol(1e-16);
+   lin.SetPreconditioner(prec);
+   if (shape == Shape::Linear)
+   {
+      lin.SetOperator(*A);
+      lin.Mult(RHS, X);
+      REQUIRE(lin.GetConverged());
+   }
+   else
+   {
+      dh->SetLocalNLSolver(DarcyHybridization::LSsolveType::Newton, 100,
+                           1e-14, 1e-16, -1);
+      NewtonSolver newton;
+      newton.SetSolver(lin);
+      newton.SetOperator(*A);
+      newton.SetRelTol(1e-12);
+      newton.SetAbsTol(1e-15);
+      newton.SetMaxIter(40);
+      newton.SetPrintLevel(-1);
+      newton.Mult(RHS, X);
+      REQUIRE(newton.GetConverged());
+   }
+   darcy.RecoverFEMSolution(X, x);
+
+   for (int arm = 0; arm < 2; arm++)
+   {
+      dh->SetAssemblyMode(arm ? DarcyHybridization::AssemblyMode::Batched
+                          : DarcyHybridization::AssemblyMode::Serial);
+      GridFunction ut, u_s, p_s, tr_s;
+      darcy.Reconstruct(x, X, ut, u_s, p_s, tr_s);
+      if (arm)
+      {
+         out.ut_taken = dh->CanBatchReconstructTotalFlux(*ut.FESpace());
+         out.fp_taken = darcy.CanBatchReconstruction(ut, u_s, p_s, tr_s);
+      }
+      // Read on the host, from wherever the kernels left them.
+      out.ut[arm] = ut;
+      out.u_s[arm] = u_s;
+      out.p_s[arm] = p_s;
+      out.tr_s[arm] = tr_s;
+      for (Vector *v :
+           {
+              &out.ut[arm], &out.u_s[arm], &out.p_s[arm],
+              &out.tr_s[arm]
+           })
+      {
+         v->HostRead();
+      }
+   }
+   dh->SetAssemblyMode(DarcyHybridization::AssemblyMode::Serial);
+}
+
+/// |a - b|_inf / |a|_inf, after checking that neither carries a NaN.
+real_t RelDiff(const Vector &a, const Vector &b)
+{
+   REQUIRE(a.Size() == b.Size());
+   REQUIRE(a.CheckFinite() == 0);
+   REQUIRE(b.CheckFinite() == 0);
+   Vector d(a);
+   d -= b;
+   const real_t s = a.Normlinf();
+   REQUIRE(s > 0.0);
+   return d.Normlinf() / s;
+}
+
+} // namespace darcy_reconstruction_batched
+
+/**
+ * @brief The batched reconstruction reproduces the per-element one, on all
+ * four outputs.
+ *
+ * ONE solution, reconstructed twice, so the comparison sees the
+ * reconstruction and nothing else. The total flux, the enriched flux and the
+ * enriched potential are element-local or face-local and must agree to
+ * round-off; the enriched TRACE is the one order-dependent output -- the
+ * serial replay leaves the last writer's value on every face -- and the
+ * batched route reproduces it by making that element the face's owner, so it
+ * must agree to round-off as well. A trace written by the wrong side would
+ * be off by O(1) on interior faces (2% of its norm, measured on the threaded
+ * replay's note).
+ *
+ * Both routes must have been TAKEN: CanBatchReconstructTotalFlux() and
+ * CanBatchReconstruction() are asked of the batched arm.
+ *
+ * meq's shape is the second: a domain term on the NONLINEAR potential form
+ * that the local problem drops, beside a linear face constraint, with R as a
+ * FunctionCoefficient on the flux mass and on the stabilization, and a
+ * boundary constraint integrator -- which the total-flux face pass reaches
+ * through its own list.
+ */
+TEST_CASE("The batched reconstruction reproduces the per-element one",
+          "[DarcyForm][Reconstruction][BatchedLinAlg][GPU]")
+{
+   using namespace darcy_reconstruction_batched;
+
+   const int geom = GENERATE(0, 1, 2);
+   const int order = GENERATE(0, 1, 2);
+   const Shape shape = GENERATE(Shape::Linear, Shape::NonlinearWithSource);
+   const char *names[3] = {"triangles", "quadrilaterals", "hexahedra"};
+   CAPTURE(names[geom], order, (int)shape);
+
+   Mesh mesh = (geom == 0)
+               ? Mesh::MakeCartesian2D(5, 4, Element::TRIANGLE, true, 1.0, 1.0)
+               : (geom == 1)
+               ? Mesh::MakeCartesian2D(5, 4, Element::QUADRILATERAL, true, 1.0, 1.0)
+               : Mesh::MakeCartesian3D(2, 3, 2, Element::HEXAHEDRON);
+   mesh.Transform([](const Vector &x, Vector &y)
+   {
+      y = x;
+      y(0) += 0.11 * x(1);
+      y(1) += 0.05 * x(0) * x(0);
+   });
+
+   REQUIRE(mesh.GetNodes() == nullptr);
+   Both b;
+   SolveAndReconstruct(mesh, order, shape, b);
+   REQUIRE(b.ut_taken);
+   REQUIRE(b.fp_taken);
+   // The batched routes left the mesh without nodes, as the per-element ones
+   // do; see HDGElementGeometry.
+   REQUIRE(mesh.GetNodes() == nullptr);
+
+   const real_t tol = 1e-11;
+   CHECK(RelDiff(b.ut[0], b.ut[1]) < tol);
+   CHECK(RelDiff(b.u_s[0], b.u_s[1]) < tol);
+   CHECK(RelDiff(b.p_s[0], b.p_s[1]) < tol);
+   CHECK(RelDiff(b.tr_s[0], b.tr_s[1]) < tol);
+}

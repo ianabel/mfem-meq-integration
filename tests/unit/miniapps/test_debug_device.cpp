@@ -437,10 +437,15 @@ private:
 /// all BatchedLinAlg calls or mfem::forall kernels -- and with a Device
 /// configured it leaves the recovered fields DEVICE-valid, which is the
 /// second thing this file is for.
+///
+/// @a serial_after switches a Batched solve to LocalFactorMode::Serial part
+/// way through, with no new factorisation: 1 after Finalize(), so ReduceRHS()
+/// is per-element, and 2 after FormLinearSystem(), so ComputeSolution() is.
+/// Either then reads factors the batched route left where it left them.
 void Solve(bool sync, Vector &trace, Vector &pot,
            DarcyHybridization::LocalFactorMode mode =
               DarcyHybridization::LocalFactorMode::Serial,
-           Vector *flux = NULL)
+           Vector *flux = NULL, int serial_after = 0)
 {
    const int n = 4, order = 1, dim = 2;
    Mesh mesh = Mesh::MakeCartesian2D(n, n, Element::QUADRILATERAL, false,
@@ -514,7 +519,19 @@ void Solve(bool sync, Vector &trace, Vector &pot,
    RHS.MakeRef(rhs, offs[2], Mh.GetVSize());
    BlockVector dsol(sol, darcy.GetOffsets()), drhs(rhs, darcy.GetOffsets());
    OperatorPtr R;
+   const auto to_serial = [&]()
+   {
+      darcy.GetHybridization()->SetLocalFactorMode(
+         DarcyHybridization::LocalFactorMode::Serial);
+      REQUIRE_FALSE(darcy.GetHybridization()->CanBatchLocalSolve());
+   };
+   if (serial_after == 1)
+   {
+      darcy.Finalize();
+      to_serial();
+   }
    darcy.FormLinearSystem(ess_flux, dsol, drhs, R, X, RHS, true);
+   if (serial_after == 2) { to_serial(); }
 
    SparseMatrix *H = dynamic_cast<SparseMatrix *>(R.Ptr());
    REQUIRE(H != nullptr);
@@ -1224,6 +1241,45 @@ TEST_CASE("Darcy batched local algebra under a device", "[DebugDevice]")
 }
 
 /**
+ * @brief The linear route's per-element solves after a batched factorisation.
+ *
+ * ComputeH()'s fully batched branch leaves A's and D's factors where the
+ * batched factorisation put them, so the per-element MultInv() in
+ * ReduceRHS() and ComputeSolution() has to sync them itself. Within one
+ * factor mode neither is reached after a batched factorisation; switching the
+ * mode part way through is how a caller gets there. Falsified per section:
+ * with that routine's own sync removed, each faults under Device("debug").
+ * The NPC legs' twin is in "The NPC legs leave their outputs on the device".
+ */
+TEST_CASE("The linear route's per-element solves after a batched "
+          "factorisation under a device", "[DebugDevice]")
+{
+   using namespace darcy_alias;
+   using LFM = DarcyHybridization::LocalFactorMode;
+
+   int serial_after = 0;
+   SECTION("ReduceRHS()") { serial_after = 1; }
+   SECTION("ComputeSolution()") { serial_after = 2; }
+   CAPTURE(serial_after);
+
+   Vector tr_ref, pot_ref, q_ref, tr, pot, q;
+   Solve(true, tr_ref, pot_ref, LFM::Serial, &q_ref);
+   Solve(true, tr, pot, LFM::Batched, &q, serial_after);
+
+   const auto check = [](Vector &a, const Vector &ref)
+   {
+      REQUIRE(a.Size() == ref.Size());
+      REQUIRE(a.CheckFinite() == 0);
+      REQUIRE(ref.Normlinf() > 1e-6);
+      a -= ref;
+      REQUIRE(a.Normlinf() < 1e-12 * ref.Normlinf());
+   };
+   check(tr, tr_ref);
+   check(pot, pot_ref);
+   check(q, q_ref);
+}
+
+/**
  * @brief The same, on the NPC route, in both gradient modes.
  *
  * The linear case above reaches ReduceRHS() and ComputeSolution(). A
@@ -1412,6 +1468,79 @@ TEST_CASE("The NPC legs leave their outputs on the device", "[DebugDevice]")
       REQUIRE(ut_ref.Normlinf() > 1e-6);
       ut -= ut_ref;
       REQUIRE(ut.Normlinf() == 0.0);
+   }
+
+   SECTION("The per-element legs after a batched gradient")
+   {
+      // ComputeH() after the batched gradient leaves A's and D's factors on
+      // the device (meq: 24 MB of a run's 38 MB down was that readback), so
+      // the per-element MultInv() and MultInvBlocked() have to sync them for
+      // themselves. Within one factor mode they are never reached after a
+      // batched gradient; switching the mode without a new gradient is how
+      // a caller gets there. One leg per section, each on its own gradient:
+      // the first per-element leg's sync leaves the factors host-readable,
+      // so a second leg in the same run would pass without its own.
+      // Falsified per section: with that leg's sync removed, each faults in
+      // LUFactors under Device("debug").
+      const int ncols = 2;
+      // 0 and 1 are the one-column NPCReduce() and NPCRecover(), 2 and 3 the
+      // blocked ones; @a out gets one Vector per column.
+      auto run_leg = [&](int which, std::vector<Vector> &out)
+      {
+         const int nc = (which < 2) ? 1 : ncols;
+         std::vector<Vector> b_tr(nc);
+         std::vector<BlockVector> dx(nc);
+         Array<const BlockVector *> r_ptr(nc);
+         Array<const Vector *> rt_ptr(nc), dtr_ptr(nc);
+         Array<Vector *> b_ptr(nc);
+         Array<BlockVector *> dx_ptr(nc);
+         for (int j = 0; j < nc; j++)
+         {
+            dx[j].Update(offs);
+            r_ptr[j] = &r;
+            rt_ptr[j] = &r_tr;
+            dtr_ptr[j] = &dtr;
+            b_ptr[j] = &b_tr[j];
+            dx_ptr[j] = &dx[j];
+         }
+         switch (which)
+         {
+            case 0: dh->NPCReduce(r, r_tr, b_tr[0]); break;
+            case 1: dh->NPCRecover(r, dtr, dx[0]); break;
+            case 2: dh->NPCReduce(r_ptr, rt_ptr, b_ptr); break;
+            case 3: dh->NPCRecover(r_ptr, dtr_ptr, dx_ptr); break;
+         }
+         out.clear();
+         for (int j = 0; j < nc; j++)
+         {
+            if (which % 2 == 0) { out.push_back(b_tr[j]); }
+            else { out.push_back(dx[j]); }
+         }
+      };
+
+      int which = -1;
+      SECTION("NPCReduce() one column") { which = 0; }
+      SECTION("NPCRecover() one column") { which = 1; }
+      SECTION("NPCReduce() several columns") { which = 2; }
+      SECTION("NPCRecover() several columns") { which = 3; }
+      CAPTURE(which);
+
+      std::vector<Vector> bat, ser;
+      run_leg(which, bat);
+      dh->SetLocalFactorMode(LFM::Serial);
+      REQUIRE_FALSE(dh->CanBatchLocalSolve());
+      REQUIRE_FALSE(dh->CanBatchNPCTraversal());
+      run_leg(which, ser);
+
+      REQUIRE(ser.size() == bat.size());
+      for (size_t j = 0; j < ser.size(); j++)
+      {
+         CAPTURE(j);
+         REQUIRE(ser[j].CheckFinite() == 0);
+         REQUIRE(bat[j].Normlinf() > 1e-6);
+         ser[j] -= bat[j];
+         REQUIRE(ser[j].Normlinf() < 1e-12 * bat[j].Normlinf());
+      }
    }
 }
 
@@ -2650,6 +2779,128 @@ TEST_CASE("The linear route's batched trace matrix keeps its essential rows "
    {
       REQUIRE(std::abs(b[i] - s[i]) <= 1e-12 * scale);
    }
+}
+
+/**
+ * @brief The batched reconstruction and the batched flux constraint under a
+ * device, against the per-element routes, with every output read back only
+ * through HostRead().
+ *
+ * Under Device("debug") a raw host access to device-valid memory faults, so
+ * this is what checks the flags the new routes leave: C built by a kernel in
+ * ConstructC() (DarcyHybridization::SetDefaultAssemblyMode(Batched) makes
+ * Init() take it) and then read raw by the host loops that follow, and the
+ * total flux and the three enriched fields the reconstruction kernels write.
+ * The per-element reconstruction runs AFTER the batched one from the same
+ * object, so it also reads a C that a kernel wrote.
+ */
+TEST_CASE("The batched reconstruction under a device", "[DebugDevice]")
+{
+   using AM = DarcyHybridization::AssemblyMode;
+   const int order = GENERATE(1, 2);
+   // meq's configuration as well: R the first component of the mesh's own
+   // nodes, read by a GridFunctionCoefficient ON THE DEVICE, and a tau rule,
+   // so that the one-sided face matrices, the element mass and the
+   // constraint's normals all take their device weights and geometry -- and
+   // the host code after them still finds what it reads.
+   const bool meq = GENERATE(false, true);
+   CAPTURE(order, meq);
+
+   const AM saved = DarcyHybridization::GetDefaultAssemblyMode();
+   DarcyHybridization::SetDefaultAssemblyMode(AM::Batched);
+
+   Mesh mesh = Mesh::MakeCartesian2D(4, 3, Element::TRIANGLE, true, 1.0, 1.0);
+   if (meq) { mesh.EnsureNodes(); }
+   mesh.Transform([](const Vector &x, Vector &y)
+   {
+      y = x;
+      y(0) += 0.1 * x(1) * x(1);
+   });
+   if (meq)
+   {
+      // R = 1 + x as a coordinate, so that both arms carry the same R.
+      mesh.Transform([](const Vector &x, Vector &y) { y = x; y(0) += 1.0; });
+   }
+   const int dim = mesh.Dimension();
+   L2_FECollection u_coll(order, dim), p_coll(order, dim);
+   FiniteElementSpace fes_u(&mesh, &u_coll, dim), fes_p(&mesh, &p_coll);
+   FunctionCoefficient R_fn([](const Vector &x) { return 1.0 + x(0); });
+   GridFunctionCoefficient R_gf(mesh.GetNodes(), 1);
+   Coefficient &R = meq ? (Coefficient&)R_gf : (Coefficient&)R_fn;
+   HDGStabilizationRule rule;
+   rule.c0 = 2.0;
+   rule.coord = 0;
+   rule.floor = 1.3;
+   HDGRuleStabilization tau(rule);
+
+   DarcyForm darcy(&fes_u, &fes_p);
+   auto *mass = new VectorMassIntegrator(R);
+   darcy.GetFluxMassForm()->AddDomainIntegrator(mass);
+   MixedBilinearForm *B = darcy.GetFluxDivForm();
+   B->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   Array<int> bdr(mesh.bdr_attributes.Max());
+   bdr = 1;
+   B->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-2.0)), bdr);
+   auto *face_i = new HDGDiffusionIntegrator(R, 2.0);
+   auto *face_b = new HDGDiffusionIntegrator(R, 2.0);
+   if (meq)
+   {
+      face_i->SetStabilization(tau);
+      face_b->SetStabilization(tau);
+   }
+   darcy.GetPotentialMassForm()->AddInteriorFaceIntegrator(face_i);
+   darcy.GetPotentialMassForm()->AddBdrFaceIntegrator(face_b, bdr);
+   REQUIRE(HDGFaceWeightsOnDevice(*face_i, fes_p) == meq);
+   REQUIRE(HDGElementMassOnDevice(*mass, fes_u) == meq);
+
+   Array<int> ess;
+   DG_Interface_FECollection trace_coll(order, dim);
+   FiniteElementSpace fes_t(&mesh, &trace_coll);
+   darcy.EnableHybridization(&fes_t, new NormalTraceJumpIntegrator(), ess);
+   DarcyHybridization *h = darcy.GetHybridization();
+   REQUIRE(h->CanBatchConstraintAssembly());
+   h->SetEssentialBC(bdr);
+   darcy.Assemble();
+
+   BlockVector x(darcy.GetOffsets());
+   x.Randomize(1);
+   Vector X(fes_t.GetVSize());
+   X.Randomize(2);
+
+   GridFunction ut[2], u[2], p[2], tr[2];
+   for (int arm = 0; arm < 2; arm++)
+   {
+      h->SetAssemblyMode(arm ? AM::Serial : AM::Batched);
+      REQUIRE_NOTHROW(darcy.Reconstruct(x, X, ut[arm], u[arm], p[arm],
+                                        tr[arm]));
+      if (arm == 0)
+      {
+         REQUIRE(h->CanBatchReconstructTotalFlux(*ut[0].FESpace()));
+         REQUIRE(darcy.CanBatchReconstruction(ut[0], u[0], p[0], tr[0]));
+      }
+   }
+   DarcyHybridization::SetDefaultAssemblyMode(saved);
+
+   auto same = [](const GridFunction &a, const GridFunction &b)
+   {
+      REQUIRE(a.Size() == b.Size());
+      const real_t *pa = a.HostRead(), *pb = b.HostRead();
+      real_t scale = 0.0, diff = 0.0;
+      for (int i = 0; i < a.Size(); i++)
+      {
+         REQUIRE(std::isfinite(pa[i]));
+         scale = std::max(scale, std::abs(pb[i]));
+         diff = std::max(diff, std::abs(pa[i] - pb[i]));
+      }
+      CAPTURE(diff, scale);
+      REQUIRE(scale > 0.0);
+      REQUIRE(diff <= 1e-11 * scale);
+   };
+   same(ut[0], ut[1]);
+   same(u[0], u[1]);
+   same(p[0], p[1]);
+   same(tr[0], tr[1]);
 }
 
 int main(int argc, char *argv[])

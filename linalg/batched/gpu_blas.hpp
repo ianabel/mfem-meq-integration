@@ -55,6 +55,16 @@ public:
 
 class GPUBlasBatchedLinAlg : public BatchedLinAlgBase
 {
+   /// The device arrays of matrix and right-hand-side pointers that the
+   /// batched getrf, getrs and getri take, and the factorizations' info
+   /// array, kept between calls. They were a fresh Array per call, which is a
+   /// device allocation and a free per call, and a free synchronizes the
+   /// device. They are rewritten on every call and only ever grow. Like the
+   /// device reduction workspaces, they make a call not reentrant across host
+   /// threads.
+   mutable Array<real_t*> ptrs;
+   mutable Array<int> info;
+
 public:
    void AddMult(const DenseTensor &A, const Vector &x, Vector &y,
                 real_t alpha = 1.0, real_t beta = 1.0,

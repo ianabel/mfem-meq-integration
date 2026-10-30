@@ -98,6 +98,30 @@ Two artefacts of §1 sit here either way: the doxygen at
 does not exist here, and `AssembleFluxMassBdrFaces()` exists solely to serve
 §1.
 
+- **A grazing-robust path family — NOT built; the design, as the user set it
+  (2026-10-28).** Since 2026-10-28 the level-set families differentiate their
+  endpoint in closed form when given `grad phi`
+  (`SetLevelSetGradient()`), and a path meeting `Gamma` at a grazing angle
+  ABORTS: there `s'` diverges and the path map itself is singular, so no
+  derivative or difference is meaningful. `CheckPathIncidence()` reports how
+  squarely paths arrive. If a family that copes with grazing is ever wanted:
+  - **the refusal belongs where paths are generated**, not where a quadrature
+    differentiates them. A family that generates paths on the fly does so at
+    the TOP of the quadrature loop: take the quadrature points, construct a
+    path for each, and there choose freely (refuse a grazing one, pick another
+    to the left or right). The constructed paths must still be differentiable
+    in the face point, since the quadratures need `da/dxi` of the map they
+    actually integrate over, and changing a path at one point alone makes the
+    integrand the derivative of no map (and breaks the tiling).
+  - **the derivative of path generation with respect to the shape of `Gamma`
+    is out of scope**; only the derivative along the face is needed.
+  - **a corner of a polygonal `Gamma`**: the endpoint is smooth on either side
+    and kinks as the ray passes the corner; a point exactly there takes
+    whichever one-sided gradient `grad_phi` returns. A face whose image
+    straddles a corner loses its rule's order; recovering it would mean
+    splitting that face's rule where the ray passes the corner, which needs
+    `Gamma`'s corners and is not built.
+
 ## 2. Coupling at a distance to an exterior boundary-integral solve
 
 **FULLY OPTIONAL, and the plan lives on `gf-hdg-subdomains-dev` as

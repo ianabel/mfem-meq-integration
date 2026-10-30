@@ -411,6 +411,9 @@ public:
    /// Get the internal GridFunction
    const GridFunction * GetGridFunction() const { return GridF; }
 
+   /// The component of a vector GridFunction this evaluates, counted from 1.
+   int GetComponent() const { return Component; }
+
    /// Evaluate the coefficient at @a ip.
    real_t Eval(ElementTransformation &T,
                const IntegrationPoint &ip) override;

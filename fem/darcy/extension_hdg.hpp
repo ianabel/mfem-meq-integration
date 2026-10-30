@@ -146,6 +146,14 @@ public:
        which at the default step floors the quadrature near @f$10^{-10}@f$
        where a closed form is exact.
 
+       **The level-set families have one when given the level set's
+       gradient** (LevelSetPath::SetLevelSetGradient() and its namesakes).
+       Their endpoint is @f$a = x + s\,t@f$ with @f$\phi(a) = 0@f$, so
+       @f$s' = -\nabla\phi\cdot(x' + s\,t')/(\nabla\phi\cdot t)@f$ and
+       @f$a' = x' + s\,t' + s'\,t@f$, with @f$x'@f$ the face's Jacobian and
+       @f$t'@f$ the derivative of the path's direction. Without the gradient
+       they return false.
+
        @a dadxi is @f$d\times(d-1)@f$, its column @a i being
        @f$\partial a/\partial\xi_i@f$. @a FTr must have its integration
        points set to @a ip already. */
@@ -227,6 +235,7 @@ public:
 class LevelSetPath : public TransferPath
 {
    PositionFunction phi;
+   VectorPositionFunction grad_phi;
    real_t search_length;
    int search_steps;
    real_t tol;
@@ -242,17 +251,75 @@ public:
        @param search_steps_   how many equal steps the search interval is cut
                               into while bracketing the sign change. More than
                               one is needed only where @f$\Gamma@f$ can be
-                              crossed twice within @a search_length_. */
+                              crossed twice within @a search_length_.
+       @param tol_            how far outside @f$\Gamma@f$, as a fraction of
+                              @a search_length_, the start of a path may lie
+                              and still count as on it. **It does not stop the
+                              bisection**, which always runs until its
+                              midpoint stops moving: a bisection stopped short
+                              makes the endpoint a staircase in the face
+                              point, which a central difference along the
+                              face amplifies (MEQ, 2026-10-28). The same holds
+                              for every family here that takes a @a tol_.
+       @param max_iter_       a cap on the bisection's halvings; double needs
+                              about 45 from a bracket of a thirty-second of
+                              the search. */
    LevelSetPath(PositionFunction phi_, real_t search_length_,
                 int search_steps_ = 1, real_t tol_ = 1e-13,
                 int max_iter_ = 100)
       : phi(std::move(phi_)), search_length(search_length_),
         search_steps(search_steps_), tol(tol_), max_iter(max_iter_) { }
 
+   /** @brief Give the gradient of the level set, and EndpointJacobian()
+       returns @f$\partial a/\partial\xi@f$ in closed form instead of
+       false.
+
+       @a grad_phi_ fills its second argument, of the size of the first, with
+       @f$\nabla\phi@f$ of the SAME level set this family was built on, at
+       any point it is asked about -- the endpoints lie on @f$\Gamma@f$,
+       outside the mesh. Nothing here can check that the two agree, and a
+       wrong gradient gives a wrong derivative with no error; the unit test
+       compares the two against a central difference, which is the check to
+       copy.
+
+       The derivative is exact in the face point, where the central difference
+       it replaces carries an @f$O(\epsilon|a|/\texttt{fd_step})@f$
+       round-off and so a dependence on the step. It needs the face map's
+       second derivatives where the face is curved.
+
+       **A path meeting @f$\Gamma@f$ at a grazing angle ABORTS**, naming the
+       face, the endpoint and @f$|\nabla\phi\cdot t|/|\nabla\phi|@f$, at
+       @f$|\nabla\phi\cdot t| \le \sqrt\epsilon\,|\nabla\phi|@f$ or a
+       gradient that is not finite. There @f$s'@f$ diverges -- the crossing
+       slides along @f$\Gamma@f$ without bound, and past tangency jumps to a
+       farther piece of it -- and that is the path map's, so a central
+       difference would only hide it. The fix is the family's directions.
+       CheckPathIncidence() finds the shallow paths before a solve.
+
+       **At a corner of a polygonal @f$\Gamma@f$** the endpoint is smooth
+       on either side and kinks where the ray passes the corner. Which side's
+       derivative a point exactly there gets is @a grad_phi_'s choice: a
+       GridFunction's gradient at a point on an element boundary is one
+       element's. A face whose image straddles a corner loses its rule's
+       order either way, which only splitting the face's rule at the corner
+       would recover; that needs @f$\Gamma@f$'s corners, and nothing here
+       has them.
+
+       Call it before the family is used: it is configuration, and the
+       family is read-only afterwards (see TransferPath). */
+   void SetLevelSetGradient(VectorPositionFunction grad_phi_)
+   { grad_phi = std::move(grad_phi_); }
+
    using TransferPath::Endpoint;
 
    void Endpoint(const Vector &x, const Vector &n,
                  Vector &xbar) const override;
+
+   /// Along the outward unit normal, @f$t' = n'@f$: zero on a straight face,
+   /// from the face map's Hessian on a curved one. False without a gradient.
+   bool EndpointJacobian(FaceElementTransformations &FTr,
+                         const IntegrationPoint &ip,
+                         DenseMatrix &dadxi) const override;
 };
 
 
@@ -335,6 +402,7 @@ class VertexConePath : public TransferPath
 {
    const Mesh *mesh;
    PositionFunction phi;
+   VectorPositionFunction grad_phi;
    real_t search_length;
    int n_rays, n_keep, search_steps, max_iter;
    real_t tol;
@@ -354,8 +422,18 @@ class VertexConePath : public TransferPath
    /// supplied one, the cone @f$C(x)@f$ as a centre angle and half width.
    /// Returns false if no ray reached @f$\Gamma@f$ even after the admissible
    /// fan was widened.
+   /// @a counts accumulates the widened, cone-restricted and tighter tallies
+   /// for this vertex, in that order, so that several vertices can be searched
+   /// at once without sharing the members they end up in.
    bool VertexDirection(const Vector &x, const Array<real_t> &normals,
-                        real_t cone_centre, real_t cone_half, Vector &t);
+                        real_t cone_centre, real_t cone_half, Vector &t,
+                        int counts[3]) const;
+
+   /// The interpolated unit direction at @a ip of the face of @a FTr, and,
+   /// if @a dt is not null, its derivative along the face (2 x 1).
+   void FaceDirection(FaceElementTransformations &FTr,
+                      const IntegrationPoint &ip, Vector &t,
+                      DenseMatrix *dt) const;
 
 public:
    /** @param mesh_           the mesh of @f$D_h@f$.
@@ -374,11 +452,21 @@ public:
                               measured rather than stylistic** -- see the note
                               above the class. It needs the mesh to be a
                               SubMesh with a live parent; given anything else
-                              there is no cone whatever this says. */
+                              there is no cone whatever this says.
+       @param phi_thread_safe_ the caller's PROMISE that @a phi_ may be
+                              called from several threads at once. With it,
+                              and with OpenMP and no Device configured, the
+                              per-vertex search -- the ray fans and their
+                              root finds, which is where the constructor's
+                              time goes -- runs threaded. The answer is the
+                              same either way: each vertex is searched alone
+                              and the tallies are summed after. Off by
+                              default, because nothing here can check it. */
    VertexConePath(const Mesh &mesh_, int gamma_h_attr, PositionFunction phi_,
                   real_t search_length_, int n_rays_ = 16, int n_keep_ = 3,
                   int search_steps_ = 32, real_t tol_ = 1e-13,
-                  int max_iter_ = 100, bool use_cone_ = false);
+                  int max_iter_ = 100, bool use_cone_ = false,
+                  bool phi_thread_safe_ = false);
 
    using TransferPath::Endpoint;
 
@@ -391,6 +479,52 @@ public:
 
    void Endpoint(FaceElementTransformations &FTr, const IntegrationPoint &ip,
                  Vector &xbar) const override;
+
+   /** @brief Give the gradient of the level set, and EndpointJacobian()
+       returns @f$\partial a/\partial\xi@f$ in closed form instead of
+       false.
+
+       @a grad_phi_ fills its second argument, of the size of the first, with
+       @f$\nabla\phi@f$ of the SAME level set this family was built on, at
+       any point it is asked about -- the endpoints lie on @f$\Gamma@f$,
+       outside the mesh. Nothing here can check that the two agree, and a
+       wrong gradient gives a wrong derivative with no error; the unit test
+       compares the two against a central difference, which is the check to
+       copy.
+
+       The derivative is exact in the face point, where the central difference
+       it replaces carries an @f$O(\epsilon|a|/\texttt{fd_step})@f$
+       round-off and so a dependence on the step. It needs the face map's
+       second derivatives where the face is curved.
+
+       **A path meeting @f$\Gamma@f$ at a grazing angle ABORTS**, naming the
+       face, the endpoint and @f$|\nabla\phi\cdot t|/|\nabla\phi|@f$, at
+       @f$|\nabla\phi\cdot t| \le \sqrt\epsilon\,|\nabla\phi|@f$ or a
+       gradient that is not finite. There @f$s'@f$ diverges -- the crossing
+       slides along @f$\Gamma@f$ without bound, and past tangency jumps to a
+       farther piece of it -- and that is the path map's, so a central
+       difference would only hide it. The fix is the family's directions.
+       CheckPathIncidence() finds the shallow paths before a solve.
+
+       **At a corner of a polygonal @f$\Gamma@f$** the endpoint is smooth
+       on either side and kinks where the ray passes the corner. Which side's
+       derivative a point exactly there gets is @a grad_phi_'s choice: a
+       GridFunction's gradient at a point on an element boundary is one
+       element's. A face whose image straddles a corner loses its rule's
+       order either way, which only splitting the face's rule at the corner
+       would recover; that needs @f$\Gamma@f$'s corners, and nothing here
+       has them.
+
+       Call it before the family is used: it is configuration, and the
+       family is read-only afterwards (see TransferPath). */
+   void SetLevelSetGradient(VectorPositionFunction grad_phi_)
+   { grad_phi = std::move(grad_phi_); }
+
+   /// With the interpolated direction's own derivative for @f$t'@f$. False
+   /// without a gradient.
+   bool EndpointJacobian(FaceElementTransformations &FTr,
+                         const IntegrationPoint &ip,
+                         DenseMatrix &dadxi) const override;
 
    /** @brief How many vertices needed the admissible fan widened past the
        condition that the path leave @f$D_h@f$ through both adjacent faces.
@@ -459,6 +593,7 @@ class TiltedPath : public TransferPath
 {
    const TransferPath &base;
    PositionFunction phi;
+   VectorPositionFunction grad_phi;
    real_t gamma;
    real_t search_length;
    int search_steps;
@@ -468,6 +603,11 @@ class TiltedPath : public TransferPath
    /// Replace @a xbar by the tilted path's end if the path from @a x is too
    /// close to the face. Returns whether it was.
    bool Tilt(const Vector &x, const Vector &n, Vector &xbar) const;
+
+   /// The tilted direction for the wrapped family's endpoint @a xbar, if the
+   /// path from @a x is too close to the face; returns whether it is.
+   bool TiltDirection(const Vector &x, const Vector &n, const Vector &xbar,
+                      Vector &t) const;
 
 public:
    /** @param base_           the family whose paths are kept where they are
@@ -490,8 +630,53 @@ public:
    void Endpoint(FaceElementTransformations &FTr, const IntegrationPoint &ip,
                  Vector &xbar) const override;
 
-   /// The wrapped family's Jacobian where the path is not tilted. Where it
-   /// is, false, so that the caller falls back to a central difference.
+   /** @brief Give the gradient of the level set, and EndpointJacobian()
+       returns @f$\partial a/\partial\xi@f$ in closed form instead of
+       false.
+
+       @a grad_phi_ fills its second argument, of the size of the first, with
+       @f$\nabla\phi@f$ of the SAME level set this family was built on, at
+       any point it is asked about -- the endpoints lie on @f$\Gamma@f$,
+       outside the mesh. Nothing here can check that the two agree, and a
+       wrong gradient gives a wrong derivative with no error; the unit test
+       compares the two against a central difference, which is the check to
+       copy.
+
+       The derivative is exact in the face point, where the central difference
+       it replaces carries an @f$O(\epsilon|a|/\texttt{fd_step})@f$
+       round-off and so a dependence on the step. It needs the face map's
+       second derivatives where the face is curved.
+
+       **A path meeting @f$\Gamma@f$ at a grazing angle ABORTS**, naming the
+       face, the endpoint and @f$|\nabla\phi\cdot t|/|\nabla\phi|@f$, at
+       @f$|\nabla\phi\cdot t| \le \sqrt\epsilon\,|\nabla\phi|@f$ or a
+       gradient that is not finite. There @f$s'@f$ diverges -- the crossing
+       slides along @f$\Gamma@f$ without bound, and past tangency jumps to a
+       farther piece of it -- and that is the path map's, so a central
+       difference would only hide it. The fix is the family's directions.
+       CheckPathIncidence() finds the shallow paths before a solve.
+
+       **At a corner of a polygonal @f$\Gamma@f$** the endpoint is smooth
+       on either side and kinks where the ray passes the corner. Which side's
+       derivative a point exactly there gets is @a grad_phi_'s choice: a
+       GridFunction's gradient at a point on an element boundary is one
+       element's. A face whose image straddles a corner loses its rule's
+       order either way, which only splitting the face's rule at the corner
+       would recover; that needs @f$\Gamma@f$'s corners, and nothing here
+       has them.
+
+       Call it before the family is used: it is configuration, and the
+       family is read-only afterwards (see TransferPath). */
+   void SetLevelSetGradient(VectorPositionFunction grad_phi_)
+   { grad_phi = std::move(grad_phi_); }
+
+   /** @brief The wrapped family's Jacobian where the path is not tilted.
+       Where it is, the tilted ray's in closed form if this family was given
+       the gradient AND the wrapped family has a Jacobian of its own at that
+       point (the tilted direction is built from the wrapped path's), and
+       false otherwise, so that the caller falls back to a central
+       difference. The wrapped family's gradient is the wrapped family's to
+       be given. */
    bool EndpointJacobian(FaceElementTransformations &FTr,
                          const IntegrationPoint &ip,
                          DenseMatrix &dadxi) const override;
@@ -1186,7 +1371,13 @@ struct ExtensionPoint
     case moved from 7.8e-16 to 1.27e-06 -- seven orders for a 6x step, which no
     @f$O(h^2)@f$ truncation can account for. Their own case had already
     recorded the same shape one axis over, for the quadrature ORDER, and
-    pinning it on both sides is what they had done about that. */
+    pinning it on both sides is what they had done about that.
+
+    **WHERE THE STEP STOPS MATTERING.** A family that returns its
+    TransferPath::EndpointJacobian() -- ClosestPointPath with its map's
+    Jacobian, a level-set family given SetLevelSetGradient() -- is never
+    differenced, and both sweeps ignore @a fd_step for it, so two such sweeps
+    have no step to share. */
 inline real_t ExtensionFDStep()
 {
    return std::cbrt(std::numeric_limits<real_t>::epsilon());
@@ -1203,8 +1394,11 @@ inline real_t ExtensionFDStep()
     and integrating in @f$(\xi,t)@f$ against the Jacobian of that map is
     integrating over @f$K^{ext}_e@f$. The Jacobian's columns are
     @f$(1-t)\,\partial x/\partial\xi_i + t\,\partial a/\partial\xi_i@f$ and
-    @f$a(x)-x@f$; the derivative of @f$a@f$ along the face is taken by central
-    differences, because a path family is a map and not required to supply one.
+    @f$a(x)-x@f$. The derivative of @f$a@f$ along the face is the family's
+    own TransferPath::EndpointJacobian() where it has one, and a central
+    difference otherwise, because a path family is a map and not required to
+    supply one. (Until 2026-10-28 this routine always took the difference,
+    and only ExtensionBoundaryQuadrature() asked the family.)
 
     Summed over the faces this is a quadrature over @f$D_h^c = \Omega\setminus
     D_h@f$ **provided the regions tile it**, which is a property of the path
@@ -1368,10 +1562,19 @@ void ExtensionBoundaryQuadrature(
     @param extra_refine how many times to refine the sampling lattice; 0 tests
                         the vertices only, which is exact for a convex
                         @f$\Omega@f$.
+    @param phi_thread_safe the caller's PROMISE that @a phi may be called from
+                        several threads at once. With it, and with OpenMP and
+                        no Device configured, the element loop runs threaded:
+                        every element is decided alone, so the marker and the
+                        count are those of the serial loop. On a mesh with
+                        nodes the lattice is mapped through
+                        Mesh::GetElementTransformation(), which writes the
+                        nodal space's shared DofTransformation, so there the
+                        loop stays serial whenever @a extra_refine >= 1.
     @returns the number of elements selected. */
 int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
                           real_t offset, Array<int> &marker,
-                          int extra_refine = 0);
+                          int extra_refine = 0, bool phi_thread_safe = false);
 
 /** @brief The selection above, followed by the removal of every element that
     would give @f$\Gamma_h@f$ a face whose paths run too close to its plane.
@@ -1397,13 +1600,16 @@ int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
     LevelSetPath and TiltedPath wrapping either of them can be used.
     VertexConePath cannot, being defined face by face on @f$D_h@f$ itself.
     In one dimension there is no such face, and this is the other overload.
+    @a phi_thread_safe reaches the first selection only; the sweeps evaluate
+    the paths through the mesh's shared face transformation and stay serial.
 
     @returns the number of elements selected. Check the outcome with
     CheckPathAngles(): if @a max_sweeps ran out, some faces may remain. */
 int MarkLevelSetSubdomain(const Mesh &mesh, const PositionFunction &phi,
                           real_t offset, Array<int> &marker,
                           const TransferPath &path, real_t min_cos,
-                          int extra_refine = 0, int max_sweeps = 20);
+                          int extra_refine = 0, int max_sweeps = 20,
+                          bool phi_thread_safe = false);
 
 /// What CheckPathAngles() found.
 struct PathAngleReport
@@ -1435,6 +1641,48 @@ struct PathAngleReport
 PathAngleReport CheckPathAngles(Mesh &D_h, int gamma_h_attr,
                                 const TransferPath &path,
                                 real_t threshold = 0.15, int order = 4);
+
+/// What CheckPathIncidence() found.
+struct PathIncidenceReport
+{
+   real_t min_cos = 1.0;  ///< smallest cosine of a path to @f$\Gamma@f$'s normal
+   int points = 0;        ///< quadrature points examined
+   int below = 0;         ///< of them, those below the threshold
+   int faces_below = 0;   ///< faces of @f$\Gamma_h@f$ with at least one
+   int worst_bdr = -1;    ///< the boundary element where min_cos was found
+};
+
+/** @brief How squarely the paths meet @f$\Gamma@f$: the cosine between each
+    path and the level set's gradient at its endpoint, @f$\nabla\phi\cdot
+    t/|\nabla\phi|@f$, over the quadrature points of every face of
+    @f$\Gamma_h@f$.
+
+    CheckPathAngles() asks how a path LEAVES @f$\Gamma_h@f$; this asks how
+    it ARRIVES. The endpoint's derivative along the face carries
+    @f$1/(\nabla\phi\cdot t)@f$, so a cosine @f$c@f$ amplifies the
+    sensitivity of the endpoint to the face point by @f$1/c@f$, and at zero
+    the path grazes @f$\Gamma@f$ and has no derivative: the level-set
+    families abort there when given a gradient
+    (LevelSetPath::SetLevelSetGradient()). Run this first to find such paths
+    before a solve does. A path into @f$\Gamma@f$ from outside reads
+    negative; one whose gradient vanishes or is not finite reads 0. Paths of
+    zero length, from points already on @f$\Gamma@f$, are skipped.
+
+    The default threshold, 0.1, bounds the amplification at ten. It is a
+    choice, not a measurement.
+
+    @param D_h           the subdomain mesh.
+    @param gamma_h_attr  the boundary attribute of @f$\Gamma_h@f$.
+    @param path          the family to examine.
+    @param grad_phi      the level set's gradient, at a point of
+                         @f$\Gamma@f$.
+    @param threshold     a point below this cosine counts in
+                         PathIncidenceReport::below.
+    @param order         the face rule's order. */
+PathIncidenceReport CheckPathIncidence(Mesh &D_h, int gamma_h_attr,
+                                       const TransferPath &path,
+                                       const VectorPositionFunction &grad_phi,
+                                       real_t threshold = 0.1, int order = 4);
 
 } // namespace mfem
 

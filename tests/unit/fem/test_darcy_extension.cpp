@@ -14,6 +14,9 @@
 
 #include <memory>
 #include <complex>
+#ifdef MFEM_USE_OPENMP
+#include <omp.h>
+#endif
 
 using namespace mfem;
 
@@ -3415,4 +3418,542 @@ TEST_CASE("Extension from subdomains: the projected lifting does not see a "
    }
 }
 
+/// A level set that is NOT convex -- a disc with a five-fold ripple -- so that
+/// the refined lattice decides elements the vertices alone would have taken.
+real_t RipplePhi(const Vector &x)
+{
+   const real_t dx = x(0) - 0.5, dy = x(1) - 0.5;
+   const real_t r = std::sqrt(dx * dx + dy * dy), th = std::atan2(dy, dx);
+   return r - (0.38 + 0.05 * std::sin(5. * th));
+}
+
+/**
+ * @brief The level-set setup, threaded on the caller's promise, gives the
+ * serial answer exactly.
+ *
+ * MarkLevelSetSubdomain() and VertexConePath's constructor run their element
+ * and vertex loops threaded when the caller passes `phi_thread_safe` and the
+ * build has OpenMP and no Device. Every iteration is decided alone, so the
+ * answer must be IDENTICAL, not close: the same marker and count, the same
+ * tallies, and every face's endpoint bit for bit.
+ *
+ * In a build without OpenMP the flag changes nothing and this compares the
+ * serial loops with themselves; it is a test only where OpenMP is on, which
+ * neither HDG tree is. It was run in one that is (see the commit).
+ */
+TEST_CASE("The level-set setup threads to the serial answer",
+          "[DarcyExtension]")
+{
+#ifdef MFEM_USE_OPENMP
+   const int saved_threads = omp_get_max_threads();
+   omp_set_num_threads(4);
+#endif
+   const int n = 60;
+   Mesh bg = Mesh::MakeCartesian2D(n, n, Element::TRIANGLE);
+
+   Array<int> m_serial;
+   for (int refine : {0, 2})
+   {
+      CAPTURE(refine);
+      Array<int> m0, m1;
+      const int c0 = MarkLevelSetSubdomain(bg, RipplePhi, 0., m0, refine);
+      const int c1 = MarkLevelSetSubdomain(bg, RipplePhi, 0., m1, refine,
+                                           true);
+      REQUIRE(c0 > 0);
+      REQUIRE(c1 == c0);
+      REQUIRE(m1.Size() == m0.Size());
+      int differ = 0;
+      for (int i = 0; i < m0.Size(); i++) { differ += (m0[i] != m1[i]); }
+      REQUIRE(differ == 0);
+      m_serial = m0;
+   }
+
+   for (int i = 0; i < bg.GetNE(); i++)
+   {
+      bg.SetAttribute(i, m_serial[i] ? 1 : 2);
+   }
+   bg.SetAttributes();
+   Array<int> domain_attr(1);
+   domain_attr[0] = 1;
+   SubMesh D_h = SubMesh::CreateFromDomain(bg, domain_attr);
+   REQUIRE(D_h.bdr_attributes.Size() == 1);
+   const int ga = D_h.bdr_attributes.Max();
+
+   for (bool cone : {false, true})
+   {
+      CAPTURE(cone);
+      VertexConePath p0(D_h, ga, RipplePhi, 4.0 / n, 16, 3, 32, 1e-13, 100,
+                        cone);
+      VertexConePath p1(D_h, ga, RipplePhi, 4.0 / n, 16, 3, 32, 1e-13, 100,
+                        cone, true);
+      REQUIRE(p0.NumVertices() > 0);
+      REQUIRE(p1.NumVertices() == p0.NumVertices());
+      REQUIRE(p1.NumWidened() == p0.NumWidened());
+      REQUIRE(p1.NumConeRestricted() == p0.NumConeRestricted());
+      REQUIRE(p1.NumTighter() == p0.NumTighter());
+      if (cone) { REQUIRE(p0.NumConeRestricted() > 0); }
+
+      const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 3);
+      Vector x0, x1;
+      int faces = 0, differ = 0;
+      for (int be = 0; be < D_h.GetNBE(); be++)
+      {
+         if (D_h.GetBdrAttribute(be) != ga) { continue; }
+         FaceElementTransformations *FTr = D_h.GetBdrFaceTransformations(be);
+         if (!FTr) { continue; }
+         faces++;
+         for (int q = 0; q < ir.GetNPoints(); q++)
+         {
+            p0.Endpoint(*FTr, ir.IntPoint(q), x0);
+            p1.Endpoint(*FTr, ir.IntPoint(q), x1);
+            for (int d = 0; d < 2; d++) { differ += (x0(d) != x1(d)); }
+         }
+      }
+      REQUIRE(faces > 0);
+      REQUIRE(differ == 0);
+   }
+#ifdef MFEM_USE_OPENMP
+   omp_set_num_threads(saved_threads);
+#endif
+}
+
 } // namespace darcy_extension
+
+namespace darcy_extension_gradient
+{
+
+using namespace darcy_extension;
+
+/// The disc as r^2 - R^2: Gamma is the same circle, and the gradient, 2(x-c),
+/// is not a unit vector, so a formula that silently assumed |grad phi| = 1
+/// cannot pass.
+real_t DiscPhi2(const Vector &x)
+{
+   Vector c; DiscCentre(c);
+   real_t r2 = 0.;
+   for (int d = 0; d < 2; d++) { r2 += (x(d) - c(d)) * (x(d) - c(d)); }
+   return r2 - disc_R * disc_R;
+}
+void DiscGrad2(const Vector &x, Vector &g)
+{
+   Vector c; DiscCentre(c);
+   g.SetSize(2);
+   for (int d = 0; d < 2; d++) { g(d) = 2. * (x(d) - c(d)); }
+}
+
+real_t BallPhi2(const Vector &x)
+{
+   Vector c; BallCentre(c);
+   real_t r2 = 0.;
+   for (int d = 0; d < 3; d++) { r2 += (x(d) - c(d)) * (x(d) - c(d)); }
+   return r2 - ball_R * ball_R;
+}
+void BallGrad2(const Vector &x, Vector &g)
+{
+   Vector c; BallCentre(c);
+   g.SetSize(3);
+   for (int d = 0; d < 3; d++) { g(d) = 2. * (x(d) - c(d)); }
+}
+
+/** The worst relative disagreement, over the face rule of every face of
+    Gamma_h, between @a path's EndpointJacobian() and a central difference of
+    its Endpoint() along the face at @a h. Interior Gauss points and a small
+    h keep the stencil on the face. Fails the test if EndpointJacobian()
+    declines anywhere. */
+real_t WorstJacobianError(Mesh &D_h, int gamma_h_attr, const TransferPath &path,
+                          real_t h, int order = 6)
+{
+   const int sdim = D_h.SpaceDimension(), fdim = sdim - 1;
+   real_t worst = 0.;
+   int points = 0;
+   Vector xp, xm;
+   DenseMatrix J;
+   for (int be = 0; be < D_h.GetNBE(); be++)
+   {
+      if (D_h.GetBdrAttribute(be) != gamma_h_attr) { continue; }
+      FaceElementTransformations *FTr = D_h.GetBdrFaceTransformations(be);
+      if (!FTr) { continue; }
+      const IntegrationRule &ir = IntRules.Get(FTr->GetGeometryType(), order);
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         FTr->SetAllIntPoints(&ip);
+         REQUIRE(path.EndpointJacobian(*FTr, ip, J));
+         REQUIRE(J.Height() == sdim);
+         REQUIRE(J.Width() == fdim);
+         for (int i = 0; i < fdim; i++)
+         {
+            IntegrationPoint p = ip, m = ip;
+            (i == 0 ? p.x : p.y) += h;
+            (i == 0 ? m.x : m.y) -= h;
+            path.Endpoint(*FTr, p, xp);
+            path.Endpoint(*FTr, m, xm);
+            real_t err = 0., scale = 0.;
+            for (int d = 0; d < sdim; d++)
+            {
+               const real_t fd = (xp(d) - xm(d)) / (2. * h);
+               err = std::max(err, std::abs(J(d, i) - fd));
+               scale = std::max(scale, std::abs(J(d, i)));
+            }
+            worst = std::max(worst, err / std::max(scale, real_t(1e-3)));
+         }
+         points++;
+      }
+   }
+   REQUIRE(points > 0);
+   return worst;
+}
+
+} // namespace darcy_extension_gradient
+
+TEST_CASE("Extension from subdomains: the bisection runs to the format's "
+          "resolution", "[DarcyExtension]")
+{
+   // tol used to stop FirstCrossing()'s bisection at a bracket of tol times
+   // the search length, which made the endpoint a staircase in the face point
+   // with steps up to that bracket; a central difference along the face
+   // turned 2.4e-13 into an error near 1e-6 in da/dxi (MEQ). The bisection
+   // now runs until its midpoint stops moving, and tol only says how far
+   // outside Gamma a start may sit. So, from points inside Gamma, tol does not
+   // move an endpoint by a bit, and every endpoint is on Gamma to what the
+   // format resolves -- which the old 1e-13 bracket was ten times coarser than.
+   using namespace darcy_extension;
+
+   const int n = 16;
+   Subdomain s = BuildSubdomain(n);
+   const real_t L = 4.0 / n;
+   LevelSetPath coarse(DiscPhi, L, 1, 1e-10), fine(DiscPhi, L, 1, 0.);
+   VertexConePath vc_coarse(*s.D_h, s.gamma_h_attr, DiscPhi, L, 16, 3, 32,
+                            1e-10);
+   VertexConePath vc_fine(*s.D_h, s.gamma_h_attr, DiscPhi, L, 16, 3, 32, 0.);
+   const real_t eps = std::numeric_limits<real_t>::epsilon();
+
+   const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 8);
+   Vector a0, a1, x;
+   int points = 0, differ = 0;
+   real_t worst_phi = 0.;
+   for (int be = 0; be < s.D_h->GetNBE(); be++)
+   {
+      if (s.D_h->GetBdrAttribute(be) != s.gamma_h_attr) { continue; }
+      FaceElementTransformations *FTr = s.D_h->GetBdrFaceTransformations(be);
+      if (!FTr) { continue; }
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         FTr->SetAllIntPoints(&ip);
+         FTr->Transform(ip, x);
+         REQUIRE(DiscPhi(x) < 0.);
+         coarse.Endpoint(*FTr, ip, a0);
+         fine.Endpoint(*FTr, ip, a1);
+         for (int d = 0; d < 2; d++) { differ += (a0(d) != a1(d)); }
+         worst_phi = std::max(worst_phi, std::abs(DiscPhi(a1)));
+         vc_coarse.Endpoint(*FTr, ip, a0);
+         vc_fine.Endpoint(*FTr, ip, a1);
+         for (int d = 0; d < 2; d++) { differ += (a0(d) != a1(d)); }
+         worst_phi = std::max(worst_phi, std::abs(DiscPhi(a1)));
+         points++;
+      }
+   }
+   CAPTURE(points, differ, worst_phi);
+   REQUIRE(points > 0);
+   REQUIRE(differ == 0);
+   // The resolution along a ray from |x| <= 1 over L, with a few ulps for
+   // DiscPhi's own sqrt. The 1e-10 bracket here would leave up to 2.5e-11.
+   REQUIRE(worst_phi <= 8. * eps * (1. + L));
+}
+
+TEST_CASE("Extension from subdomains: a level set's gradient gives the "
+          "endpoint's derivative", "[DarcyExtension]")
+{
+   // With SetLevelSetGradient(), the level-set families' EndpointJacobian()
+   // is s' = -g.(x' + s t')/(g.t), a' = x' + s t' + s' t. Checked against a
+   // central difference of Endpoint() itself, which now bisects to round-off
+   // and so differences cleanly at h = 1e-5: they must agree to the
+   // difference's own O(h^2) + O(eps/h), about 1e-10, where a wrong term in
+   // the formula is O(1). The level set is r^2 - R^2, whose gradient is not
+   // a unit vector.
+   using namespace darcy_extension;
+   using namespace darcy_extension_gradient;
+
+   const real_t h = 1e-5, tol = 1e-7;
+
+   SECTION("LevelSetPath on straight faces, in two and three dimensions")
+   {
+      Subdomain s = BuildSubdomain(16);
+      LevelSetPath ls(DiscPhi2, 4.0 / 16);
+      DenseMatrix J;
+      FaceElementTransformations *FTr = s.D_h->GetBdrFaceTransformations(0);
+      REQUIRE(FTr != nullptr);
+      REQUIRE_FALSE(ls.EndpointJacobian(*FTr, IntRules.Get(Geometry::SEGMENT,
+                                                           2).IntPoint(0), J));
+      ls.SetLevelSetGradient(DiscGrad2);
+      const real_t e2 = WorstJacobianError(*s.D_h, s.gamma_h_attr, ls, h);
+
+      Subdomain b = BuildBallSubdomain(6);
+      LevelSetPath lb(BallPhi2, 4.0 / 6);
+      lb.SetLevelSetGradient(BallGrad2);
+      const real_t e3 = WorstJacobianError(*b.D_h, b.gamma_h_attr, lb, h, 4);
+      CAPTURE(e2, e3);
+      REQUIRE(e2 < tol);
+      REQUIRE(e3 < tol);
+   }
+
+   SECTION("LevelSetPath on curved faces, where n' is not zero")
+   {
+      // Quadratic nodes, bent: the outward normal turns along every face, so
+      // a missing n' term is O(1) of the derivative's tangential part. The
+      // bend is a shrink towards the centre by a factor varying in space, so
+      // that every face curves and Gamma_h stays inside Gamma.
+      Subdomain s = BuildSubdomain(16);
+      s.D_h->SetCurvature(2);
+      s.D_h->Transform([](const Vector &x, Vector &y)
+      {
+         Vector c; DiscCentre(c);
+         const real_t f = 0.97 + 0.01 * std::sin(7. * x(1)) * std::cos(5. * x(0));
+         y.SetSize(2);
+         for (int d = 0; d < 2; d++) { y(d) = c(d) + f * (x(d) - c(d)); }
+      });
+      LevelSetPath ls(DiscPhi2, 4.0 / 16);
+      ls.SetLevelSetGradient(DiscGrad2);
+      const real_t e = WorstJacobianError(*s.D_h, s.gamma_h_attr, ls, h);
+      CAPTURE(e);
+      REQUIRE(e < tol);
+   }
+
+   SECTION("VertexConePath, whose direction turns along the face")
+   {
+      Subdomain s = BuildSubdomain(16);
+      VertexConePath vc(*s.D_h, s.gamma_h_attr, DiscPhi2, 4.0 / 16);
+      DenseMatrix J;
+      FaceElementTransformations *FTr = nullptr;
+      for (int be = 0; be < s.D_h->GetNBE() && !FTr; be++)
+      {
+         if (s.D_h->GetBdrAttribute(be) == s.gamma_h_attr)
+         { FTr = s.D_h->GetBdrFaceTransformations(be); }
+      }
+      REQUIRE(FTr != nullptr);
+      REQUIRE_FALSE(vc.EndpointJacobian(*FTr, IntRules.Get(Geometry::SEGMENT,
+                                                           2).IntPoint(0), J));
+      vc.SetLevelSetGradient(DiscGrad2);
+      const real_t e = WorstJacobianError(*s.D_h, s.gamma_h_attr, vc, h);
+      CAPTURE(e);
+      REQUIRE(e < tol);
+   }
+
+   SECTION("TiltedPath, tilted and not")
+   {
+      // Over closest-point paths with their own Jacobian. gamma = 0.95 tilts
+      // a good share of the staircase's points and leaves the rest.
+      Subdomain s = BuildSubdomain(16);
+      Vector c; DiscCentre(c);
+      ClosestPointPath cp(ClosestPointPath::Sphere(c, disc_R),
+                          ClosestPointPath::SphereJacobian(c, disc_R));
+      TiltedPath tp(cp, DiscPhi2, 0.95, 4.0 / 16);
+      const PathAngleReport r = CheckPathAngles(*s.D_h, s.gamma_h_attr, cp,
+                                                0.95, 6);
+      REQUIRE(r.below > 0);
+      REQUIRE(r.below < r.points);
+      tp.SetLevelSetGradient(DiscGrad2);
+      const real_t e = WorstJacobianError(*s.D_h, s.gamma_h_attr, tp, h);
+      CAPTURE(e, r.below, r.points);
+      REQUIRE(e < tol);
+   }
+
+   SECTION("TiltedPath in three dimensions, where the tilt turns with m")
+   {
+      // In two dimensions on a straight face the tilted direction's part
+      // along the face can only be plus or minus the face's tangent, so it
+      // does not turn and the wrapped path's own derivative drops out of t'.
+      // In three it is the wrapped direction projected onto the face's
+      // plane, which turns with it: the term a 2-D case cannot see.
+      Subdomain b = BuildBallSubdomain(6);
+      Vector c; BallCentre(c);
+      ClosestPointPath cp(ClosestPointPath::Sphere(c, ball_R),
+                          ClosestPointPath::SphereJacobian(c, ball_R));
+      TiltedPath tp(cp, BallPhi2, 0.95, 4.0 / 6);
+      const PathAngleReport r = CheckPathAngles(*b.D_h, b.gamma_h_attr, cp,
+                                                0.95, 4);
+      REQUIRE(r.below > 0);
+      tp.SetLevelSetGradient(BallGrad2);
+      const real_t e = WorstJacobianError(*b.D_h, b.gamma_h_attr, tp, h, 4);
+      CAPTURE(e, r.below, r.points);
+      REQUIRE(e < tol);
+   }
+
+   SECTION("with a gradient the quadratures no longer depend on the step")
+   {
+      // BoundarySum() lives in the file's nested namespace.
+      using namespace ::darcy_extension::darcy_extension;
+      // The step matters only where something is differenced. Given the
+      // gradient, nothing is, so both sweeps give the same bits at any step;
+      // without it they do not, which is the control.
+      Subdomain s = BuildSubdomain(16);
+      VertexConePath with(*s.D_h, s.gamma_h_attr, DiscPhi2, 4.0 / 16);
+      VertexConePath without(*s.D_h, s.gamma_h_attr, DiscPhi2, 4.0 / 16);
+      with.SetLevelSetGradient(DiscGrad2);
+      const real_t step = ExtensionFDStep();
+      const real_t b1 = BoundarySum(*s.D_h, s.gamma_h_attr, with, false, 20,
+                                    step);
+      const real_t b2 = BoundarySum(*s.D_h, s.gamma_h_attr, with, false, 20,
+                                    8. * step);
+      const real_t c1 = BoundarySum(*s.D_h, s.gamma_h_attr, without, false,
+                                    20, step);
+      const real_t c2 = BoundarySum(*s.D_h, s.gamma_h_attr, without, false,
+                                    20, 8. * step);
+      auto region = [&](const TransferPath &p, real_t st)
+      {
+         const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 20);
+         real_t area = 0.;
+         for (int be = 0; be < s.D_h->GetNBE(); be++)
+         {
+            if (s.D_h->GetBdrAttribute(be) != s.gamma_h_attr) { continue; }
+            FaceElementTransformations *FTr =
+               s.D_h->GetBdrFaceTransformations(be);
+            if (!FTr) { continue; }
+            ExtensionRegionQuadrature(*FTr, p, ir, ir,
+                                      [&](const ExtensionPoint &pt)
+            { area += pt.weight; }, st);
+         }
+         return area;
+      };
+      const real_t r1 = region(with, step), r2 = region(with, 8. * step);
+      const real_t q1 = region(without, step), q2 = region(without, 8. * step);
+      const real_t truth = 2. * M_PI * disc_R;
+      const real_t area = ComplementMeasure(*s.D_h);
+      CAPTURE(b1, b2, c1, c2, r1, r2, q1, q2, truth, area);
+      REQUIRE(b1 == b2);
+      REQUIRE(r1 == r2);
+      REQUIRE(c1 != c2);
+      REQUIRE(q1 != q2);
+      REQUIRE(b1 == Approx(truth).epsilon(1e-8));
+      REQUIRE(r1 == Approx(area).epsilon(1e-8));
+   }
+}
+
+TEST_CASE("Extension from subdomains: how squarely the paths meet Gamma",
+          "[DarcyExtension]")
+{
+   // CheckPathIncidence() reads grad(phi).t/|grad(phi)| at each endpoint. On
+   // the disc it is the cosine between a path and the radius there, which is
+   // computable independently; a gradient pointing along the face's own
+   // tangent instead makes every path "graze", and the report must see it.
+   using namespace darcy_extension;
+   using namespace darcy_extension_gradient;
+
+   Subdomain s = BuildSubdomain(16);
+   LevelSetPath ls(DiscPhi2, 4.0 / 16);
+   const PathIncidenceReport r = CheckPathIncidence(*s.D_h, s.gamma_h_attr, ls,
+                                                    DiscGrad2, 0.1, 4);
+   const PathAngleReport a = CheckPathAngles(*s.D_h, s.gamma_h_attr, ls, 0.15,
+                                             4);
+   CAPTURE(r.min_cos, r.points, r.below, a.points);
+   REQUIRE(r.points == a.points);
+   REQUIRE(r.points > 0);
+   REQUIRE(r.min_cos > 0.);
+   REQUIRE(r.min_cos <= 1.);
+   REQUIRE(r.below == 0);
+   REQUIRE(r.worst_bdr >= 0);
+
+   // The independent value: the smallest cosine between a normal ray and
+   // the radius at its endpoint.
+   {
+      Vector c; DiscCentre(c);
+      Vector x, xbar;
+      real_t want = 1.;
+      const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 4);
+      for (int be = 0; be < s.D_h->GetNBE(); be++)
+      {
+         if (s.D_h->GetBdrAttribute(be) != s.gamma_h_attr) { continue; }
+         FaceElementTransformations *FTr = s.D_h->GetBdrFaceTransformations(be);
+         if (!FTr) { continue; }
+         for (int q = 0; q < ir.GetNPoints(); q++)
+         {
+            const IntegrationPoint &ip = ir.IntPoint(q);
+            FTr->SetAllIntPoints(&ip);
+            FTr->Transform(ip, x);
+            ls.Endpoint(*FTr, ip, xbar);
+            real_t dot = 0., ml = 0.;
+            for (int d = 0; d < 2; d++)
+            {
+               dot += (xbar(d) - x(d)) * (xbar(d) - c(d));
+               ml += (xbar(d) - x(d)) * (xbar(d) - x(d));
+            }
+            want = std::min(want, dot / (std::sqrt(ml) * disc_R));
+         }
+      }
+      REQUIRE(r.min_cos == Approx(want).epsilon(1e-10));
+   }
+
+   // Everything below a threshold above one.
+   const PathIncidenceReport all = CheckPathIncidence(
+                                      *s.D_h, s.gamma_h_attr, ls, DiscGrad2,
+                                      1.01, 4);
+   REQUIRE(all.below == all.points);
+   REQUIRE(all.faces_below > 0);
+
+   // A gradient perpendicular to every path, and one that is not finite.
+   auto sideways = [&](const Vector &x, Vector &g)
+   {
+      Vector c; DiscCentre(c);
+      g.SetSize(2);
+      g(0) = -(x(1) - c(1));
+      g(1) = x(0) - c(0);
+   };
+   const PathIncidenceReport z = CheckPathIncidence(
+                                    *s.D_h, s.gamma_h_attr, ls,
+                                    [](const Vector &x, Vector &g)
+   { g.SetSize(x.Size()); g = std::numeric_limits<real_t>::quiet_NaN(); },
+   0.1, 4);
+   REQUIRE(z.below == z.points);
+   REQUIRE(z.min_cos == 0.);
+   const PathIncidenceReport w = CheckPathIncidence(*s.D_h, s.gamma_h_attr, ls,
+                                                    sideways, 0.1, 4);
+   CAPTURE(w.min_cos);
+   REQUIRE(w.below > 0);
+}
+
+#ifdef MFEM_USE_EXCEPTIONS
+TEST_CASE("Extension from subdomains: a grazing path is refused",
+          "[DarcyExtension]")
+{
+   // Where grad(phi).t vanishes s' diverges, and the families abort rather
+   // than return a derivative with no digits in it, or hand the quadrature a
+   // central difference of the same singular map.
+   using namespace darcy_extension;
+   using namespace darcy_extension_gradient;
+
+   Subdomain s = BuildSubdomain(16);
+   FaceElementTransformations *FTr = nullptr;
+   int be0 = -1;
+   for (int be = 0; be < s.D_h->GetNBE() && !FTr; be++)
+   {
+      if (s.D_h->GetBdrAttribute(be) == s.gamma_h_attr)
+      { FTr = s.D_h->GetBdrFaceTransformations(be); be0 = be; }
+   }
+   REQUIRE(FTr != nullptr);
+   const IntegrationPoint &ip = IntRules.Get(Geometry::SEGMENT, 2).IntPoint(0);
+   FTr->SetAllIntPoints(&ip);
+   // The face's own tangent as the "gradient": exactly perpendicular to the
+   // normal ray, since CalcOrtho() swaps the tangent's components.
+   Vector tan(2);
+   tan(0) = FTr->Jacobian()(0, 0);
+   tan(1) = FTr->Jacobian()(1, 0);
+   LevelSetPath graze(DiscPhi2, 4.0 / 16);
+   graze.SetLevelSetGradient([tan](const Vector &x, Vector &g) { g = tan; });
+   DenseMatrix J;
+   FTr = s.D_h->GetBdrFaceTransformations(be0);
+   REQUIRE_THROWS(graze.EndpointJacobian(*FTr, ip, J));
+
+   LevelSetPath nan(DiscPhi2, 4.0 / 16);
+   nan.SetLevelSetGradient([](const Vector &x, Vector &g)
+   { g.SetSize(x.Size()); g = std::numeric_limits<real_t>::quiet_NaN(); });
+   FTr = s.D_h->GetBdrFaceTransformations(be0);
+   REQUIRE_THROWS(nan.EndpointJacobian(*FTr, ip, J));
+
+   // And the honest gradient at the same point is fine.
+   LevelSetPath ok(DiscPhi2, 4.0 / 16);
+   ok.SetLevelSetGradient(DiscGrad2);
+   FTr = s.D_h->GetBdrFaceTransformations(be0);
+   REQUIRE(ok.EndpointJacobian(*FTr, ip, J));
+}
+#endif

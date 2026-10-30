@@ -75,16 +75,19 @@ struct Stage
 void PrintLedger(const Array<Stage*> &stages, real_t total)
 {
    cout << "\n"
-        << "  stage                        where            time (s)\n"
-        << "  ---------------------------------------------------------\n";
+        << "  stage                           where                        "
+        "time (s)\n"
+        << "  ---------------------------------------------------------"
+        "-------------------\n";
    for (Stage *s : stages)
    {
-      cout << "  " << left << setw(28) << s->name
-           << setw(17) << s->device
+      cout << "  " << left << setw(32) << s->name
+           << setw(29) << s->device
            << right << fixed << setprecision(4) << s->secs << "\n";
    }
-   cout << "  ---------------------------------------------------------\n"
-        << "  " << left << setw(45) << "total" << right << fixed
+   cout << "  ---------------------------------------------------------"
+        "-------------------\n"
+        << "  " << left << setw(61) << "total" << right << fixed
         << setprecision(4) << total << "\n\n";
 }
 
@@ -96,6 +99,7 @@ int main(int argc, char *argv[])
    int order = 2, n = 64;
    bool use_cudss = false;
    bool baseline = true;
+   bool convection = true;
    OptionsParser args(argc, argv);
    args.AddOption(&device_config, "-d", "--device",
                   "Device configuration string, see Device::Configure(). "
@@ -109,6 +113,13 @@ int main(int argc, char *argv[])
                   "end of the chain off the host. Needs MFEM_USE_CUDSS; "
                   "without it the trace solve falls back to UMFPACK and the "
                   "ledger says so.");
+   args.AddOption(&convection, "-conv", "--convection", "-noconv",
+                  "--no-convection",
+                  "Put the upwinded convection term on the potential "
+                  "constraint (the default), or leave the pure diffusion one "
+                  "meq's problem has. The reconstruction's one-sided face "
+                  "kernel takes diffusion only, so with convection the two "
+                  "reconstruction lines report the host.");
    args.AddOption(&baseline, "-cmp", "--compare", "-no-cmp", "--no-compare",
                   "Also solve with every device setting off and compare, "
                   "which is what separates a stage that ran from a stage that "
@@ -127,7 +138,7 @@ int main(int argc, char *argv[])
    L2_FECollection p_coll(order, dim);
    DG_Interface_FECollection t_coll(order, dim);
 
-   Vector sol_ref;
+   Vector sol_ref, post_ref;
    real_t tr_norm_ref = 0.;
 
    // Two passes: the device settings, then the control. The second is skipped
@@ -161,14 +172,29 @@ int main(int argc, char *argv[])
 
       BilinearForm *M_p = darcy.GetPotentialMassForm();
       M_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0));
-      M_p->AddInteriorFaceIntegrator(
-         new HDGConvectionUpwindedIntegrator(vel, 1.0, 0.5));
+      if (convection)
+      {
+         M_p->AddInteriorFaceIntegrator(
+            new HDGConvectionUpwindedIntegrator(vel, 1.0, 0.5));
+      }
       M_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(one, 1.0));
 
       Array<int> ess_flux;
+      // The flux constraint C is assembled inside EnableHybridization(), by
+      // Init(), before this code holds the hybridization -- so the only way
+      // to have it batched is the process-wide default, set first.
+      DarcyHybridization::SetDefaultAssemblyMode(
+         on ? DarcyHybridization::AssemblyMode::Batched
+         : DarcyHybridization::AssemblyMode::Serial);
+      StopWatch sw_c;
+      sw_c.Start();
       darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+      sw_c.Stop();
 
       DarcyHybridization *dh = darcy.GetHybridization();
+      Stage s_c{"flux constraint C (in Enable)",
+                dh->CanBatchConstraintAssembly() ? "device kernel"
+                : "host per-face", sw_c.RealTime()};
       if (on)
       {
          dh->SetAssemblyMode(DarcyHybridization::AssemblyMode::Batched);
@@ -364,6 +390,35 @@ int main(int argc, char *argv[])
                   dh->CanBatchLocalSolve() ? "device batched, no readback"
                   : "host loop", sw.RealTime()};
 
+      // The rich reconstruction, timed apart in its two halves and each asked
+      // which route it took. From a FIXED synthetic state, the same in both
+      // passes, and not from the solve above: that makes the p* comparison
+      // printed below a comparison of the two reconstruction routes and of
+      // nothing else -- and the solve's own comparison is void on this
+      // problem; see the note where it is printed. Only the RESULTS are read
+      // back, below, after the total.
+      BlockVector sol(darcy.GetOffsets());
+      sol.Randomize(7);
+      Vector sol_tr(Mh.GetVSize());
+      sol_tr.Randomize(8);
+      GridFunction rut, ru, rp, rtr;
+      sw.Clear();
+      sw.Start();
+      darcy.ReconstructTotalFlux(sol, sol_tr, rut);
+      MFEM_DEVICE_SYNC;
+      sw.Stop();
+      Stage s_rtf{"reconstruct: total flux",
+                  dh->CanBatchReconstructTotalFlux(*rut.FESpace())
+                  ? "device kernels" : "host loops", sw.RealTime()};
+      sw.Clear();
+      sw.Start();
+      darcy.ReconstructFluxAndPot(sol, rut, ru, rp, rtr);
+      MFEM_DEVICE_SYNC;
+      sw.Stop();
+      Stage s_rfp{"reconstruct: flux + potential",
+                  darcy.CanBatchReconstruction(rut, ru, rp, rtr)
+                  ? "device kernels" : "host loop", sw.RealTime()};
+
       total.Stop();
 
       cout << "\n=== " << (on ? "device settings ON" : "control: all OFF")
@@ -374,6 +429,7 @@ int main(int argc, char *argv[])
            << dh->NumPotFaceConstraintIntegrators() << "\n";
 
       Array<Stage*> stages;
+      stages.Append(&s_c);
       stages.Append(&s_asm);
       stages.Append(&s_mass);
       stages.Append(&s_pmass);
@@ -388,27 +444,50 @@ int main(int argc, char *argv[])
       stages.Append(&s_red);
       stages.Append(&s_tr);
       stages.Append(&s_rec);
+      stages.Append(&s_rtf);
+      stages.Append(&s_rfp);
       PrintLedger(stages, total.RealTime());
 
       // The answer, read on the host -- which is itself the transfer the
       // target forbids, and is deliberately the LAST thing that happens.
-      Vector sol(dx.GetBlock(1));
-      sol.HostRead();
+      Vector sol_p(dx.GetBlock(1));
+      sol_p.HostRead();
+      Vector post(rp);
+      post.HostRead();
       if (on)
       {
-         sol_ref = sol;
+         sol_ref = sol_p;
+         post_ref = post;
          tr_norm_ref = dtr.Norml2();
       }
       else
       {
          Vector d(sol_ref);
-         d -= sol;
+         d -= sol_p;
+         Vector dp(post_ref);
+         dp -= post;
          cout << "  potential:  |device - control| / |control| = "
               << scientific << setprecision(3)
-              << ((sol.Norml2() > 0.) ? (d.Norml2() / sol.Norml2()) : 0.)
+              << ((sol_p.Norml2() > 0.) ? (d.Norml2() / sol_p.Norml2()) : 0.)
+              << "\n"
+              << "  p*:         |device - control| / |control| = "
+              << ((post.Norml2() > 0.) ? (dp.Norml2() / post.Norml2()) : 0.)
               << "\n"
               << "  trace norm: " << tr_norm_ref << " against "
-              << dtr.Norml2() << "\n\n";
+              << dtr.Norml2() << "\n";
+         // NOT a solution, and the harness said nothing for as long as it has
+         // existed. The NPC trace matrix this problem assembles is singular --
+         // UMFPack's rcond is about 1e-240, with the essential trace rows
+         // eliminated or not -- and UMFPack then returns zeros (or 1e100-size
+         // garbage) without failing. Measured 2026-10-27, the September binary
+         // included. Not diagnosed here; the p* line above does not depend on
+         // it, being taken from a fixed state.
+         if (dtr.Norml2() == 0.0 || tr_norm_ref == 0.0)
+         {
+            cout << "  (the potential and trace lines compare no solution: the "
+                 "trace system is singular here and the solve returned zero)\n";
+         }
+         cout << "\n";
       }
    }
 
@@ -461,5 +540,7 @@ int main(int argc, char *argv[])
         << "    host wherever a host loop is still the consumer, and it is\n"
         << "    the loops that have to go, not the syncs.\n";
 
+   DarcyHybridization::SetDefaultAssemblyMode(
+      DarcyHybridization::AssemblyMode::Serial);
    return 0;
 }

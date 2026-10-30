@@ -55,6 +55,7 @@ int NumIntegs(FaceTerm t)
 enum class MassTerm
 {
    Plain,        ///< VectorMassIntegrator(), no coefficient
+   Constant,     ///< ... with a ConstantCoefficient, weighed on the device
    Scalar,       ///< ... with a Coefficient
    Diagonal,     ///< ... with a VectorCoefficient
    Matrix,       ///< ... with a MatrixCoefficient, the coupled block
@@ -66,6 +67,7 @@ const char *Name(MassTerm t)
    switch (t)
    {
       case MassTerm::Plain:     return "flux mass, no coefficient";
+      case MassTerm::Constant:  return "flux mass, constant";
       case MassTerm::Scalar:    return "flux mass, scalar";
       case MassTerm::Diagonal:  return "flux mass, diagonal";
       case MassTerm::Matrix:    return "flux mass, matrix";
@@ -135,6 +137,7 @@ void AssembleGradient(Mesh &mesh, int order, FaceTerm term,
       return 1.0 + 0.5 * X(0) * X(1);
    });
 
+   ConstantCoefficient cconst(2.5);
    VectorFunctionCoefficient dcoeff(dim, [](const Vector &X, Vector &v)
    {
       v(0) = 1.5 + 0.4 * X(0);
@@ -228,6 +231,10 @@ void AssembleGradient(Mesh &mesh, int order, FaceTerm term,
       case MassTerm::Plain:
          darcy.GetFluxMassForm()->AddDomainIntegrator(
             wrap(new VectorMassIntegrator()));
+         break;
+      case MassTerm::Constant:
+         darcy.GetFluxMassForm()->AddDomainIntegrator(
+            wrap(new VectorMassIntegrator(cconst)));
          break;
       case MassTerm::Diagonal:
          darcy.GetFluxMassForm()->AddDomainIntegrator(
@@ -583,9 +590,9 @@ TEST_CASE("The batched HDG element mass assembles the per-element blocks",
    using namespace darcy_batched_face;
    using AM = DarcyHybridization::AssemblyMode;
 
-   const MassTerm mass = GENERATE(MassTerm::Plain, MassTerm::Scalar,
-                                  MassTerm::Diagonal, MassTerm::Matrix,
-                                  MassTerm::PotScalar);
+   const MassTerm mass = GENERATE(MassTerm::Plain, MassTerm::Constant,
+                                  MassTerm::Scalar, MassTerm::Diagonal,
+                                  MassTerm::Matrix, MassTerm::PotScalar);
    const int order = GENERATE(0, 1, 2);
    const int n = GENERATE(2, 4);
    // TRIANGLES as well as quads, and that is the point rather than extra
@@ -599,10 +606,28 @@ TEST_CASE("The batched HDG element mass assembles the per-element blocks",
 
    Mesh mesh_a = Mesh::MakeCartesian2D(n, n, geom);
    Mesh mesh_b = Mesh::MakeCartesian2D(n, n, geom);
+   // NOT a uniform grid: with every element alike, det J is one number and a
+   // kernel reading the wrong element's would pass. Measured: indexing the
+   // device determinants by element 0 passed on the uniform grid.
+   auto warp = [](const Vector &x, Vector &y)
+   {
+      y = x;
+      y(0) += 0.15 * x(0) * x(1);
+      y(1) += 0.1 * x(0) * x(0);
+   };
+   mesh_a.Transform(warp);
+   mesh_b.Transform(warp);
 
    Outcome ref, got;
+   REQUIRE(mesh_b.GetNodes() == nullptr);
    AssembleGradient(mesh_a, order, FaceTerm::Diffusion, AM::Serial, ref, mass);
    AssembleGradient(mesh_b, order, FaceTerm::Diffusion, AM::Batched, got, mass);
+   // The batched route left the caller's mesh as the per-element route does.
+   // It used to take its geometry from Mesh::GetGeometricFactors(), which
+   // adds nodes to a mesh without them; see HDGElementGeometry for what that
+   // moved in meq's mirror solve.
+   REQUIRE(mesh_a.GetNodes() == nullptr);
+   REQUIRE(mesh_b.GetNodes() == nullptr);
 
    // The flux kernel was taken, and the potential one exactly when there is a
    // potential mass domain integrator to take. Without this the comparison
@@ -633,6 +658,73 @@ TEST_CASE("The batched HDG element mass assembles the per-element blocks",
    const real_t scale = ref.data.Normlinf();
    CAPTURE(d.Normlinf(), scale);
    REQUIRE(d.Normlinf() <= 1e-14 * scale);
+}
+
+/**
+ * @brief HDGElementGeometry gives the element transformation's own Jacobians
+ * and determinants, with nodes or without, and adds no nodes.
+ *
+ * Without nodes it maps vertices itself, so a wrong index into the vertex
+ * table or the derivative table would show here on a warped mesh, where no two
+ * elements share a Jacobian. With nodes it hands back GeometricFactors.
+ */
+TEST_CASE("The batched element geometry is the element transformation's",
+          "[DarcyHybridization][BatchedLinAlg][GPU]")
+{
+   const int kind = GENERATE(0, 1, 2, 3);
+   const bool nodes = GENERATE(false, true);
+   const char *names[4] = {"triangles", "quadrilaterals", "tetrahedra",
+                           "hexahedra"
+                          };
+   CAPTURE(names[kind], nodes);
+
+   Mesh mesh = (kind == 0) ? Mesh::MakeCartesian2D(4, 3, Element::TRIANGLE)
+               : (kind == 1) ? Mesh::MakeCartesian2D(4, 3, Element::QUADRILATERAL)
+               : (kind == 2) ? Mesh::MakeCartesian3D(2, 3, 2, Element::TETRAHEDRON)
+               : Mesh::MakeCartesian3D(2, 3, 2, Element::HEXAHEDRON);
+   const int dim = mesh.Dimension();
+   mesh.Transform([](const Vector &x, Vector &y)
+   {
+      y = x;
+      y(0) += 0.15 * x(0) * x(1);
+      y(1) += 0.1 * x(0) * x(0);
+   });
+   if (nodes) { mesh.EnsureNodes(); }
+   REQUIRE((mesh.GetNodes() != nullptr) == nodes);
+
+   const IntegrationRule &ir =
+      IntRules.Get(mesh.GetElementBaseGeometry(0), 4);
+   const int NQ = ir.GetNPoints(), NE = mesh.GetNE();
+   const HDGElementGeometry geom(mesh, ir, GeometricFactors::JACOBIANS |
+                                 GeometricFactors::DETERMINANTS);
+   REQUIRE((mesh.GetNodes() != nullptr) == nodes);
+
+   REQUIRE(geom.J().Size() == NQ * dim * dim * NE);
+   REQUIRE(geom.DetJ().Size() == NQ * NE);
+   const auto J = Reshape(geom.J().HostRead(), NQ, dim, dim, NE);
+   const auto W = Reshape(geom.DetJ().HostRead(), NQ, NE);
+   real_t dJ = 0.0, dW = 0.0, sJ = 0.0, sW = 0.0;
+   for (int e = 0; e < NE; e++)
+   {
+      ElementTransformation *T = mesh.GetElementTransformation(e);
+      for (int q = 0; q < NQ; q++)
+      {
+         T->SetIntPoint(&ir.IntPoint(q));
+         const DenseMatrix &Jt = T->Jacobian();
+         for (int i = 0; i < dim; i++)
+            for (int j = 0; j < dim; j++)
+            {
+               dJ = std::max(dJ, std::abs(Jt(i, j) - J(q, i, j, e)));
+               sJ = std::max(sJ, std::abs(Jt(i, j)));
+            }
+         dW = std::max(dW, std::abs(T->Weight() - W(q, e)));
+         sW = std::max(sW, std::abs(T->Weight()));
+      }
+   }
+   CAPTURE(dJ, sJ, dW, sW);
+   REQUIRE(sJ > 0.0);
+   REQUIRE(dJ <= 4 * std::numeric_limits<real_t>::epsilon() * sJ);
+   REQUIRE(dW <= 4 * std::numeric_limits<real_t>::epsilon() * sW);
 }
 
 /** Reduce a LINEAR problem with essential flux values, and hand back the
@@ -809,6 +901,187 @@ TEST_CASE("The batched HDG flux mass scatter fills Ae for the RHS elimination",
    d -= Bbat;
    CAPTURE(d.Normlinf(), Bref.Normlinf());
    REQUIRE(d.Normlinf() <= 1e-13 * Bref.Normlinf());
+}
+
+namespace darcy_batched_face
+{
+
+/// SetDefaultAssemblyMode() for one scope, restored on the way out whatever
+/// happens -- a REQUIRE that fails throws.
+struct DefaultModeScope
+{
+   DarcyHybridization::AssemblyMode saved;
+   explicit DefaultModeScope(DarcyHybridization::AssemblyMode m)
+      : saved(DarcyHybridization::GetDefaultAssemblyMode())
+   { DarcyHybridization::SetDefaultAssemblyMode(m); }
+   ~DefaultModeScope() { DarcyHybridization::SetDefaultAssemblyMode(saved); }
+};
+
+/** The NPC trace gradient of a pure-diffusion problem whose hybridization was
+    CONSTRUCTED in @a am -- which is what decides how ConstructC() builds C,
+    since Init() runs inside EnableHybridization(). @a taken reports
+    CanBatchConstraintAssembly() as Init() saw it. */
+void ConstraintGradient(Mesh &mesh, int order, bool ess_flux_dofs,
+                        DarcyHybridization::AssemblyMode am, Outcome &out)
+{
+   DefaultModeScope scope(am);
+   const int dim = mesh.Dimension();
+
+   L2_FECollection u_coll(order, dim, BasisType::GaussLobatto);
+   L2_FECollection p_coll(order, dim);
+   DG_Interface_FECollection t_coll(order, dim);
+   FiniteElementSpace Vh(&mesh, &u_coll, dim), Wh(&mesh, &p_coll),
+                      Mh(&mesh, &t_coll);
+
+   DarcyForm darcy(&Vh, &Wh);
+   FunctionCoefficient kappa([](const Vector &X)
+   { return 1.0 + 0.5 * X(0) * X(1); });
+   darcy.GetFluxMassForm()->AddDomainIntegrator(
+      new VectorMassIntegrator(kappa));
+   darcy.GetFluxDivForm()->AddDomainIntegrator(new VectorDivergenceIntegrator());
+   darcy.GetFluxDivForm()->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-1.0)));
+   BilinearForm *M_p = darcy.GetPotentialMassForm();
+   M_p->AddInteriorFaceIntegrator(new HDGDiffusionIntegrator(kappa, 1.0));
+   M_p->AddBdrFaceIntegrator(new HDGDiffusionIntegrator(kappa, 1.0));
+
+   Array<int> ess_flux;
+   if (ess_flux_dofs)
+   {
+      // Hand-made, as in AssembleGradient(): an L2 flux has no boundary dofs.
+      // Essential hat dofs are what make the batched compaction skip rows.
+      for (int i = 0; i < Vh.GetVSize(); i += 7) { ess_flux.Append(i); }
+   }
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+
+   DarcyHybridization *dh = darcy.GetHybridization();
+   out.taken = dh->CanBatchConstraintAssembly();
+   // Everything AFTER Init() serial in both arms, so that the constraint is
+   // the only thing the two differ in.
+   dh->SetAssemblyMode(DarcyHybridization::AssemblyMode::Serial);
+   dh->EnableNPC();
+   Array<int> ess_bdr(mesh.bdr_attributes.Max());
+   ess_bdr = 1;
+   dh->SetEssentialBC(ess_bdr);
+
+   darcy.Assemble();
+   darcy.Finalize();
+
+   BlockVector x(darcy.GetOffsets());
+   x = 0.0;
+   Vector x_tr(Mh.GetVSize());
+   x_tr = 0.0;
+   Operator &S = dh->NPCGradient(x, x_tr);
+   SparseMatrix *Sm = dynamic_cast<SparseMatrix*>(&S);
+   REQUIRE(Sm != nullptr);
+   Sm->HostReadI();
+   Sm->HostReadJ();
+   Sm->HostReadData();
+
+   const int nrows = Sm->Height(), nnz = Sm->NumNonZeroElems();
+   out.I.SetSize(nrows + 1);
+   std::copy(Sm->GetI(), Sm->GetI() + nrows + 1, out.I.begin());
+   out.J.SetSize(nnz);
+   std::copy(Sm->GetJ(), Sm->GetJ() + nnz, out.J.begin());
+   out.data.SetSize(nnz);
+   std::copy(Sm->GetData(), Sm->GetData() + nnz, out.data.GetData());
+}
+
+} // namespace darcy_batched_face
+
+/**
+ * @brief The batched flux constraint builds ConstructC()'s C.
+ *
+ * C enters the NPC gradient through `C A^{-1} C^T`, so the assembled trace
+ * matrix sees every block of it and both sides of every interior face. The
+ * threshold ConstructC() applies per face is seen only because the host
+ * comparison is EXACT; see the assertion.
+ *
+ * The essential flux dofs are what make the compaction skip rows: without
+ * them every hat dof is a row and a row map that ignored the marker would
+ * still pass.
+ *
+ * And the predicate is asked as Init() saw it -- the batched arm has to have
+ * TAKEN the kernel, or this compares the per-face loop with itself.
+ */
+TEST_CASE("The batched flux constraint assembles ConstructC()'s blocks",
+          "[DarcyHybridization][BatchedLinAlg][GPU]")
+{
+   using namespace darcy_batched_face;
+   using AM = DarcyHybridization::AssemblyMode;
+
+   const int geom = GENERATE(0, 1, 2, 3);
+   const int order = GENERATE(0, 1, 2, 3);
+   const bool ess = GENERATE(false, true);
+   // With nodes as well: the normals are taken on the device from each face's
+   // own point matrix, which is its node dofs on a mesh with nodes.
+   const bool nodes = GENERATE(false, true);
+   const char *names[4] = {"triangles", "quadrilaterals", "tetrahedra",
+                           "hexahedra"
+                          };
+   CAPTURE(names[geom], order, ess, nodes);
+   if (geom >= 2 && order == 3) { return; }
+
+   auto make = [geom]()
+   {
+      switch (geom)
+      {
+         case 0: return Mesh::MakeCartesian2D(5, 4, Element::TRIANGLE, true,
+                                                 1.3, 0.9);
+         case 1: return Mesh::MakeCartesian2D(5, 4, Element::QUADRILATERAL,
+                                                 true, 1.3, 0.9);
+         case 2: return Mesh::MakeCartesian3D(2, 3, 2, Element::TETRAHEDRON,
+                                                 1.0, 1.2, 0.8);
+         default: return Mesh::MakeCartesian3D(2, 3, 2, Element::HEXAHEDRON,
+                                                  1.0, 1.2, 0.8);
+      }
+   };
+   Mesh mesh_a = make(), mesh_b = make();
+   if (nodes)
+   {
+      mesh_a.EnsureNodes();
+      mesh_b.EnsureNodes();
+   }
+   // Off the axes, so that no normal is axis-aligned and the threshold has
+   // round-off to remove rather than exact zeros.
+   auto skew = [](const Vector &x, Vector &y)
+   {
+      y = x;
+      y(0) += 0.13 * x(1);
+      y(1) += 0.07 * x(0) * x(0);
+   };
+   mesh_a.Transform(skew);
+   mesh_b.Transform(skew);
+
+   Outcome ref, got;
+   ConstraintGradient(mesh_a, order, ess, AM::Serial, ref);
+   ConstraintGradient(mesh_b, order, ess, AM::Batched, got);
+
+   REQUIRE_FALSE(ref.taken);
+   REQUIRE(got.taken);
+   REQUIRE(ref.data.Size() > 0);
+   REQUIRE(got.I.Size() == ref.I.Size());
+   for (int i = 0; i < ref.I.Size(); i++) { REQUIRE(got.I[i] == ref.I[i]); }
+   for (int i = 0; i < ref.J.Size(); i++) { REQUIRE(got.J[i] == ref.J[i]); }
+
+   Vector d(ref.data);
+   d -= got.data;
+   const real_t scale = ref.data.Normlinf();
+   CAPTURE(d.Normlinf(), scale);
+   // BIT FOR BIT on the host, and that is what makes the threshold visible:
+   // the entries it zeroes are round-off, about 1e-16 of the block, so with
+   // it deleted the gradient moves by less than any relative tolerance would
+   // notice -- measured, 1e-14 passed without it. The kernel does the
+   // integrator's arithmetic in the integrator's order, so the host gives
+   // the same bits; a GPU contracts to FMAs and gets round-off instead.
+   if (Device::Allows(Backend::CUDA_MASK | Backend::HIP_MASK))
+   {
+      REQUIRE(d.Normlinf() <= 1e-14 * scale);
+   }
+   else
+   {
+      REQUIRE(d.Normlinf() == 0.0);
+   }
 }
 
 #ifdef MFEM_USE_MPI

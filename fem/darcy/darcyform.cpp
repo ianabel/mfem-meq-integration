@@ -13,6 +13,8 @@
 #include "bilininteg_hdg.hpp"
 #include "../hyperbolic.hpp"
 #include "../nonlininteg_mixed.hpp"
+#include "../../general/forall.hpp"
+#include "../../linalg/batched/batched.hpp"
 
 namespace mfem
 {
@@ -1625,6 +1627,9 @@ void DarcyForm::ReconstructTotalFlux(const BlockVector &sol,
    }
    else
    {
+      // The identity law is the one a kernel can take without a callback.
+      if (hybridization->ReconstructTotalFluxBatched(sol, sol_r, ut)) { return; }
+
       auto fx = [](ElementTransformation &Tr, const Vector &q, const Vector &p,
                    Vector &qt)
       {
@@ -2015,6 +2020,11 @@ const
    // makes with SetIntegratorsThreadSafe() altogether. It is ours, not the
    // caller's, so it should not be in that promise.
    VectorDivergenceGridFunctionCoefficient bp_coeff(&ut, neq);
+
+   // The batched route, wherever everything the local problem is built from
+   // has a kernel; see ReconstructFluxAndPotBatched(). What follows is the
+   // per-element route, and under AssemblyMode::Serial the exact one.
+   if (ReconstructFluxAndPotBatched(h, pc, ut, u, p, tr, Mp_nl)) { return; }
 
    u = 0.;
    p = 0.;
@@ -2600,6 +2610,515 @@ const
 
       z_beg = z_end;
    }
+}
+
+/// MFEM's signed-index read; see DarcyHybridization's HDGSignedAt().
+MFEM_HOST_DEVICE inline real_t HDGReconSignedAt(const real_t *v, int j)
+{
+   return (j >= 0) ? v[j] : -v[-1 - j];
+}
+
+/** @brief Assemble the local problems of elements [@a z0, @a z0 + @a nc) of
+    DarcyForm::ReconstructFluxAndPotBatched() into @a A (N x N each,
+    column-major) and @a rhs, in the per-element route's order of writes.
+
+    A free function and not a member, for the nvcc reason recorded on
+    DarcyHybridization's TransposeBlocksScaled(). */
+void HDGReconAssemble(int z0, int nc, int NU, int NP, int NFE, int TRD,
+                      int TRUT, int NDUT, int NPC, bool have_pot,
+                      const Vector &Mu, const Vector &Bd, const Vector &Ct,
+                      const Vector &Pf, const Array<int> &side,
+                      int NQE, const Vector &we, const Vector &phe,
+                      const Vector &dve, const Vector &dete,
+                      int NQF, const Vector &wf, const Vector &trf,
+                      const Vector &utf,
+                      int NQC, const Vector &wc, const Vector &phc,
+                      const Vector &pcc, const Vector &detc,
+                      const Array<int> &ut_evd, const Array<int> &ut_fvd,
+                      const Array<int> &pc_vd, const Vector &ut,
+                      const Vector &pc, DenseTensor &A, Vector &rhs)
+{
+   const int nu = NU, np = NP, nfe = NFE, trd = TRD, ndut = NDUT, npc = NPC;
+   const int trut = TRUT;
+   const int N = NU + NP + NFE * TRD, NPT = NP + TRD;
+   const int nqe = NQE, nqf = NQF, nqc = NQC, zb = z0;
+   const bool pot = have_pot;
+   const real_t *d_Mu = Mu.Read(), *d_Bd = Bd.Read(), *d_Ct = Ct.Read();
+   const real_t *d_Pf = pot ? Pf.Read() : nullptr;
+   const int *d_side = side.Read();
+   const real_t *d_we = we.Read(), *d_wf = wf.Read(), *d_wc = wc.Read();
+   const auto d_phe = Reshape(phe.Read(), NQE, NP);
+   const auto d_dve = Reshape(dve.Read(), NQE, NDUT);
+   const auto d_trf = Reshape(trf.Read(), NQF, TRD);
+   const auto d_utf = Reshape(utf.Read(), NQF, TRUT);
+   const auto d_phc = Reshape(phc.Read(), NQC, NP);
+   const auto d_pcc = Reshape(pcc.Read(), NQC, NPC);
+   const real_t *d_dete = dete.Read(), *d_detc = detc.Read();
+   const int *d_utevd = ut_evd.Read(), *d_utfvd = ut_fvd.Read();
+   const int *d_pcvd = pc_vd.Read();
+   const real_t *d_ut = ut.Read(), *d_pc = pc.Read();
+   real_t *d_A = A.Write();
+   real_t *d_r = rhs.Write();
+
+   // The MATRIX, one thread per entry. Each entry belongs to exactly one block
+   // of the local problem, and the thread finds which and computes it in the
+   // per-element route's order: the flux mass, the divergence and its negated
+   // transpose, each face's constraint and its transpose, the potential
+   // constraint's D summed over the faces in the element's own order and its
+   // E, G and H, and the closure row. One thread per element filling the
+   // whole 42 x 42 block was 110 ms a call on meq's mesh (nsys).
+   mfem::forall(nc * N * N, [=] MFEM_HOST_DEVICE (int idx)
+   {
+      const int r = idx % N, cl = (idx / N) % N, c = idx / (N * N);
+      const int z = zb + c;
+      real_t v = 0.0;
+      if (r == nu)
+      {
+         // The closure: the first potential equation replaced by the element
+         // average of the computed potential.
+         if (cl >= nu && cl < nu + np)
+         {
+            const int i = cl - nu;
+            for (int q = 0; q < nqc; q++)
+            {
+               v += (d_wc[q] * d_detc[q + nqc * z]) * d_phc(q, i);
+            }
+         }
+      }
+      else if (r < nu)
+      {
+         if (cl < nu) { v = d_Mu[r + nu * cl + nu * nu * z]; }
+         else if (cl < nu + np) { v = -d_Bd[(cl - nu) + np * r + np * nu * z]; }
+         else
+         {
+            const int j = (cl - nu - np) / trd, l = (cl - nu - np) % trd;
+            v = d_Ct[r + nu * l + nu * trd * (nfe * z + j)];
+         }
+      }
+      else if (r < nu + np)
+      {
+         const int a = r - nu;
+         if (cl < nu) { v = d_Bd[a + np * cl + np * nu * z]; }
+         else if (cl < nu + np)
+         {
+            if (pot)
+            {
+               for (int j = 0; j < nfe; j++)
+               {
+                  v += d_Pf[a + NPT * (cl - nu) + NPT * NPT * (nfe * z + j)];
+               }
+            }
+         }
+         else if (pot)
+         {
+            const int j = (cl - nu - np) / trd, l = (cl - nu - np) % trd;
+            v = d_Pf[a + NPT * (np + l) + NPT * NPT * (nfe * z + j)];
+         }
+      }
+      else
+      {
+         const int j = (r - nu - np) / trd, l = (r - nu - np) % trd;
+         const int k = nfe * z + j;
+         if (cl < nu) { v = d_Ct[cl + nu * l + nu * trd * k]; }
+         else if (cl < nu + np)
+         {
+            if (pot) { v = d_Pf[(np + l) + NPT * (cl - nu) + NPT * NPT * k]; }
+         }
+         else if (pot)
+         {
+            const int jj = (cl - nu - np) / trd, m = (cl - nu - np) % trd;
+            if (jj == j) { v = d_Pf[(np + l) + NPT * (np + m) + NPT * NPT * k]; }
+         }
+      }
+      d_A[r + N * cl + N * N * c] = v;
+   });
+
+   // The RIGHT-HAND SIDE, one thread per entry.
+   mfem::forall(nc * N, [=] MFEM_HOST_DEVICE (int idx)
+   {
+      const int r = idx % N, c = idx / N;
+      const int z = zb + c;
+      real_t v = 0.0;
+      if (r == nu)
+      {
+         const int *pv = d_pcvd + npc * z;
+         for (int q = 0; q < nqc; q++)
+         {
+            const real_t w = d_wc[q] * d_detc[q + nqc * z];
+            real_t val = 0.0;
+            for (int i = 0; i < npc; i++)
+            {
+               val += d_pcc(q, i) * HDGReconSignedAt(d_pc, pv[i]);
+            }
+            v += val * w;
+         }
+      }
+      else if (r > nu && r < nu + np)
+      {
+         // (div u*_t, w), VectorDomainLFIntegrator's arithmetic.
+         const int i = r - nu;
+         const int *tv = d_utevd + ndut * z;
+         for (int q = 0; q < nqe; q++)
+         {
+            real_t s = 0.0;
+            for (int a = 0; a < ndut; a++)
+            {
+               s += d_dve(q, a) * HDGReconSignedAt(d_ut, tv[a]);
+            }
+            const real_t det = d_dete[q + nqe * z];
+            const real_t cf = det * (s / det);
+            v += d_we[q] * cf * d_phe(q, i);
+         }
+      }
+      else if (r >= nu + np)
+      {
+         // <u*_t . n, mu>, negated on the face's second side.
+         const int j = (r - nu - np) / trd, l = (r - nu - np) % trd;
+         const int k = nfe * z + j;
+         const int *fv = d_utfvd + trut * k;
+         const real_t sgn = d_side[k] ? -1.0 : 1.0;
+         for (int q = 0; q < nqf; q++)
+         {
+            real_t s = 0.0;
+            for (int a = 0; a < trut; a++)
+            {
+               s += d_utf(q, a) * HDGReconSignedAt(d_ut, fv[a]);
+            }
+            const real_t w = d_wf[q] * s;
+            v += sgn * (w * d_trf(q, l));
+         }
+      }
+      d_r[r + N * c] = v;
+   });
+}
+
+/** @brief Store the local solutions of elements [@a z0, @a z0 + @a nc) into
+    the enriched flux, potential and trace. The trace of a face is written by
+    its OWNER alone -- the highest-numbered element listing it, which is the
+    one the serial replay leaves there -- so no two threads write one dof. */
+void HDGReconScatter(int z0, int nc, int NU, int NP, int NFE, int TRD,
+                     const Array<int> &u_vd, const Array<int> &p_vd,
+                     const Array<int> &el_face, const Array<int> &owner,
+                     const Array<int> &tr_vd, const Vector &sol,
+                     Vector &u, Vector &p, Vector &tr)
+{
+   const int nu = NU, np = NP, nfe = NFE, trd = TRD, zb = z0;
+   const int N = NU + NP + NFE * TRD;
+   const int *d_uvd = u_vd.Read(), *d_pvd = p_vd.Read();
+   const int *d_ef = el_face.Read(), *d_own = owner.Read();
+   const int *d_trvd = tr_vd.Read();
+   const real_t *d_s = sol.Read();
+   // Write(), not ReadWrite(): across the chunks every dof of all three is
+   // written exactly once, and Write() keeps the device buffer it returned for
+   // the previous chunk, so nothing need be uploaded.
+   real_t *d_u = u.Write(), *d_p = p.Write(), *d_tr = tr.Write();
+
+   mfem::forall(nc, [=] MFEM_HOST_DEVICE (int c)
+   {
+      const int z = zb + c;
+      const real_t *s = d_s + N * c;
+      for (int i = 0; i < nu; i++)
+      {
+         const int j = d_uvd[nu * z + i];
+         if (j >= 0) { d_u[j] = s[i]; }
+         else { d_u[-1 - j] = -s[i]; }
+      }
+      for (int i = 0; i < np; i++)
+      {
+         const int j = d_pvd[np * z + i];
+         if (j >= 0) { d_p[j] = s[nu + i]; }
+         else { d_p[-1 - j] = -s[nu + i]; }
+      }
+      for (int k = 0; k < nfe; k++)
+      {
+         const int f = d_ef[nfe * z + k];
+         if (d_own[f] != z) { continue; }
+         for (int l = 0; l < trd; l++)
+         {
+            const int j = d_trvd[trd * f + l];
+            const real_t v = s[nu + np + trd * k + l];
+            if (j >= 0) { d_tr[j] = v; }
+            else { d_tr[-1 - j] = -v; }
+         }
+      }
+   });
+}
+
+namespace
+{
+/// The scalar integrators a potential constraint sums, SumIntegrator unwrapped.
+void ReconPotIntegrators(BilinearFormIntegrator *c,
+                         Array<BilinearFormIntegrator*> &integs)
+{
+   integs.SetSize(0);
+   if (!c) { return; }
+   if (auto *sum = dynamic_cast<SumIntegrator*>(c))
+   {
+      for (int i = 0; i < sum->NumIntegrators(); i++)
+      {
+         integs.Append(sum->GetIntegrator(i));
+      }
+      return;
+   }
+   integs.Append(c);
+}
+
+/// Whether @a nlfi is one the local problem lifts; see ReconstructFluxAndPot().
+bool ReconLifted(NonlinearFormIntegrator *nlfi)
+{
+   return IsOrWraps<ConvectionIntegrator>(nlfi)
+          || IsOrWraps<ConservativeConvectionIntegrator>(nlfi)
+          || IsOrWraps<HyperbolicFormIntegrator>(nlfi);
+}
+} // namespace
+
+bool DarcyForm::ReconstructionCanBatch(
+   const DarcyHybridization &h, const FiniteElementSpace &fes_tr,
+   const FiniteElementSpace &fes_pc, const FiniteElementSpace &fes_ut,
+   const Array<NonlinearFormIntegrator*> *Mp_nl) const
+{
+   if (h.GetAssemblyMode() != DarcyHybridization::AssemblyMode::Batched)
+   { return false; }
+   Mesh *mesh = fes_u->GetMesh();
+#ifdef MFEM_USE_MPI
+   // Serial only: a shared face's transformation is the parallel mesh's.
+   if (dynamic_cast<ParMesh*>(mesh)) { return false; }
+#endif
+   if (fes_p->GetVDim() != 1) { return false; }
+   if (!M_u || !HDGElementMassCanBatch(*fes_u, *M_u->GetDBFI())) { return false; }
+   if (!B || !HDGElementDivCanBatch(*fes_u, *fes_p, *B->GetDBFI()))
+   { return false; }
+   // A lifted convective or hyperbolic term is assembled per element by its
+   // integrator, and none of those has a kernel here.
+   if (M_p && M_p->GetDBFI()->Size() > 0) { return false; }
+   if (Mp_nl)
+   {
+      for (NonlinearFormIntegrator *nlfi : *Mp_nl)
+      {
+         if (ReconLifted(nlfi)) { return false; }
+      }
+   }
+   if (!HDGNormalTraceJumpCanBatch(fes_tr, *fes_u,
+                                   h.GetFluxConstraintIntegrator()))
+   { return false; }
+   if (h.GetPotConstraintNonlinearIntegrator()) { return false; }
+   Array<BilinearFormIntegrator*> integs;
+   ReconPotIntegrators(h.GetPotConstraintIntegrator(), integs);
+   if (integs.Size() && !HDGFaceSideCanBatch(fes_tr, *fes_p, integs))
+   { return false; }
+
+   if (fes_ut.GetVDim() != 1 || fes_ut.IsVariableOrder()
+       || !dynamic_cast<const RT_FECollection*>(fes_ut.FEColl()))
+   { return false; }
+   {
+      Array<int> vd;
+      DofTransformation dt;
+      fes_ut.GetElementVDofs(0, vd, dt);
+      if (!dt.IsIdentity()) { return false; }
+   }
+   if (fes_pc.GetVDim() != 1 || fes_pc.IsVariableOrder()
+       || fes_pc.GetFE(0)->GetMapType() != FiniteElement::VALUE)
+   { return false; }
+   if (mesh->GetNumFaces() == 0
+       || fes_ut.GetFaceElement(0)->GetMapType() != FiniteElement::INTEGRAL)
+   { return false; }
+   return true;
+}
+
+bool DarcyForm::CanBatchReconstruction(const GridFunction &ut,
+                                       const GridFunction &u,
+                                       const GridFunction &p,
+                                       const GridFunction &tr) const
+{
+   if (!hybridization || !reconstruction) { return false; }
+   if (!ut.FESpace() || !tr.FESpace() || !u.FESpace() || !p.FESpace())
+   { return false; }
+   if (reconstruction->FluxFESpace() != u.FESpace()
+       || reconstruction->PotentialFESpace() != p.FESpace()) { return false; }
+   return reconstruction->ReconstructionCanBatch(*hybridization, *tr.FESpace(),
+                                                 *fes_p, *ut.FESpace(),
+                                                 &Mp_nl_lift);
+}
+
+bool DarcyForm::ReconstructFluxAndPotBatched(
+   const DarcyHybridization &h, const GridFunction &pc, const GridFunction &ut,
+   GridFunction &u, GridFunction &p, GridFunction &tr,
+   const Array<NonlinearFormIntegrator*> *Mp_nl) const
+{
+   const FiniteElementSpace &fes_tr = *tr.FESpace();
+   const FiniteElementSpace &fes_pc = *pc.FESpace();
+   const FiniteElementSpace &fes_ut = *ut.FESpace();
+   if (!ReconstructionCanBatch(h, fes_tr, fes_pc, fes_ut, Mp_nl))
+   { return false; }
+
+   Mesh &mesh = *fes_u->GetMesh();
+   const int NE = mesh.GetNE(), NF = mesh.GetNumFaces();
+   const int dim = mesh.Dimension();
+   const Geometry::Type geom = mesh.GetElementBaseGeometry(0);
+   const int NFE = Geometries.NumBdr(geom);
+   const FiniteElement &fe_u = *fes_u->GetFE(0);
+   const FiniteElement &fe_p = *fes_p->GetFE(0);
+   const FiniteElement &fe_pc = *fes_pc.GetFE(0);
+   const FiniteElement &fe_ut = *fes_ut.GetFE(0);
+   const FiniteElement &fe_tr = *fes_tr.GetFaceElement(0);
+   const FiniteElement &fe_utf = *fes_ut.GetFaceElement(0);
+   const int NU = fe_u.GetDof() * fes_u->GetVDim();
+   const int NP = fe_p.GetDof();
+   const int NPC = fe_pc.GetDof();
+   const int NDUT = fe_ut.GetDof();
+   const int TRD = fe_tr.GetDof();
+   // The total flux's face dofs, which are NOT the enriched trace's: that is
+   // one order higher.
+   const int TRUT = fe_utf.GetDof();
+   const int N = NU + NP + NFE * TRD;
+
+   // ---- The element's faces and each one's side, as the host route sees
+   // them; and each face's owner, the last element to list it. ------------
+   Array<int> el_face(NE * NFE), side(NE * NFE), owner(NF);
+   owner = -1;
+   {
+      Array<int> fl, oris;
+      for (int z = 0; z < NE; z++)
+      {
+         if (dim == 2) { mesh.GetElementEdges(z, fl, oris); }
+         else { mesh.GetElementFaces(z, fl, oris); }
+         MFEM_VERIFY(fl.Size() == NFE, "element " << z << " has " << fl.Size()
+                     << " faces, not " << NFE);
+         for (int j = 0; j < NFE; j++)
+         {
+            int e1, e2;
+            mesh.GetFaceElements(fl[j], &e1, &e2);
+            el_face[NFE * z + j] = fl[j];
+            side[NFE * z + j] = (e1 == z) ? 0 : 1;
+            owner[fl[j]] = z;
+         }
+      }
+   }
+
+   // ---- The index maps. -----------------------------------------------
+   Array<int> u_vd(NE * NU), p_vd(NE * NP), pc_vd(NE * NPC),
+         ut_evd(NE * NDUT), ut_fvd(NE * NFE * TRUT), tr_vd(NF * TRD), vd;
+   for (int z = 0; z < NE; z++)
+   {
+      fes_u->GetElementVDofs(z, vd);
+      for (int i = 0; i < NU; i++) { u_vd[NU * z + i] = vd[i]; }
+      fes_p->GetElementVDofs(z, vd);
+      for (int i = 0; i < NP; i++) { p_vd[NP * z + i] = vd[i]; }
+      fes_pc.GetElementVDofs(z, vd);
+      for (int i = 0; i < NPC; i++) { pc_vd[NPC * z + i] = vd[i]; }
+      fes_ut.GetElementVDofs(z, vd);
+      for (int i = 0; i < NDUT; i++) { ut_evd[NDUT * z + i] = vd[i]; }
+   }
+   for (int k = 0; k < NE * NFE; k++)
+   {
+      fes_ut.GetFaceVDofs(el_face[k], vd);
+      for (int l = 0; l < TRUT; l++) { ut_fvd[TRUT * k + l] = vd[l]; }
+   }
+   for (int f = 0; f < NF; f++)
+   {
+      fes_tr.GetFaceVDofs(f, vd);
+      for (int l = 0; l < TRD; l++) { tr_vd[TRD * f + l] = vd[l]; }
+   }
+
+   // ---- The blocks, in kernels. ----------------------------------------
+   Vector Mu, Bd, Ct, Pf;
+   HDGElementMassBatched(*fes_u, *M_u->GetDBFI(), Mu);
+   HDGElementDivBatched(*fes_u, *fes_p, *B->GetDBFI(), Bd);
+   HDGNormalTraceJumpBatched(fes_tr, *fes_u, *h.GetFluxConstraintIntegrator(),
+                             el_face, side, Ct);
+   Array<BilinearFormIntegrator*> integs;
+   ReconPotIntegrators(h.GetPotConstraintIntegrator(), integs);
+   const bool have_pot = integs.Size() > 0;
+   if (have_pot) { HDGFaceSideBatched(fes_tr, *fes_p, integs, el_face, side, Pf); }
+
+   // ---- The right-hand side's tables. ----------------------------------
+   // The element term at VectorDomainLFIntegrator's default rule, the face
+   // term at the host route's, and the closure at its own.
+   const int orderw = mesh.GetElementTransformation(0)->OrderW();
+   const IntegrationRule &ire = IntRules.Get(geom, 2 * fe_p.GetOrder());
+   const IntegrationRule &irf = IntRules.Get(fe_utf.GetGeomType(),
+                                             fe_utf.GetOrder() + fe_tr.GetOrder()
+                                             + ((fe_tr.GetMapType() != FiniteElement::VALUE)
+                                                ? mesh.GetFaceTransformation(0)->OrderW() : 0));
+   const IntegrationRule &irc = IntRules.Get(geom, fe_p.GetOrder() + orderw);
+   MFEM_VERIFY(fe_tr.GetMapType() == FiniteElement::VALUE,
+               "an INTEGRAL-mapped trace divides by the face weight per face");
+   const int NQE = ire.GetNPoints(), NQF = irf.GetNPoints(),
+             NQC = irc.GetNPoints();
+   Vector we(NQE), phe(NQE * NP), dve(NQE * NDUT);
+   Vector wf(NQF), trf(NQF * TRD), utf(NQF * TRUT);
+   Vector wc(NQC), phc(NQC * NP), pcc(NQC * NPC);
+   for (Vector *v : {&we, &phe, &dve, &wf, &trf, &utf, &wc, &phc, &pcc})
+   {
+      v->UseDevice(true);
+   }
+   {
+      Vector s;
+      real_t *pwe = we.HostWrite(), *pphe = phe.HostWrite();
+      real_t *pdve = dve.HostWrite();
+      for (int q = 0; q < NQE; q++)
+      {
+         const IntegrationPoint &ip = ire.IntPoint(q);
+         pwe[q] = ip.weight;
+         s.SetSize(NP); fe_p.CalcShape(ip, s);
+         for (int i = 0; i < NP; i++) { pphe[q + NQE * i] = s(i); }
+         s.SetSize(NDUT); fe_ut.CalcDivShape(ip, s);
+         for (int a = 0; a < NDUT; a++) { pdve[q + NQE * a] = s(a); }
+      }
+      real_t *pwf = wf.HostWrite(), *ptrf = trf.HostWrite();
+      real_t *putf = utf.HostWrite();
+      for (int q = 0; q < NQF; q++)
+      {
+         const IntegrationPoint &ip = irf.IntPoint(q);
+         pwf[q] = ip.weight;
+         s.SetSize(TRD); fe_tr.CalcShape(ip, s);
+         for (int l = 0; l < TRD; l++) { ptrf[q + NQF * l] = s(l); }
+         s.SetSize(TRUT); fe_utf.CalcShape(ip, s);
+         for (int a = 0; a < TRUT; a++) { putf[q + NQF * a] = s(a); }
+      }
+      real_t *pwc = wc.HostWrite(), *pphc = phc.HostWrite();
+      real_t *ppcc = pcc.HostWrite();
+      for (int q = 0; q < NQC; q++)
+      {
+         const IntegrationPoint &ip = irc.IntPoint(q);
+         pwc[q] = ip.weight;
+         s.SetSize(NP); fe_p.CalcShape(ip, s);
+         for (int i = 0; i < NP; i++) { pphc[q + NQC * i] = s(i); }
+         s.SetSize(NPC); fe_pc.CalcShape(ip, s);
+         for (int i = 0; i < NPC; i++) { ppcc[q + NQC * i] = s(i); }
+      }
+   }
+   // Not Mesh::GetGeometricFactors(), which would add nodes to a mesh
+   // without them; see HDGElementGeometry.
+   const HDGElementGeometry ge(mesh, ire, GeometricFactors::DETERMINANTS);
+   const HDGElementGeometry gc(mesh, irc, GeometricFactors::DETERMINANTS);
+
+   // ---- Assemble, factor, solve and store, a chunk of elements at a time.
+   // The local matrices are N^2 each -- 1764 reals at k = 2 in 2-D -- so all
+   // of them at once is a gigabyte and a half on meq's largest mesh. A chunk
+   // bounded in reals keeps the working set fixed.
+   constexpr int chunk_cap = 1 << 24;   // 128 MB at double precision
+   const int chunk = std::max(1, std::min(NE, chunk_cap / (N * N)));
+   DenseTensor A;
+   Vector rhs;
+   rhs.UseDevice(true);
+   Array<int> piv;
+   for (int z0 = 0; z0 < NE; z0 += chunk)
+   {
+      const int nc = std::min(chunk, NE - z0);
+      A.SetSize(N, N, nc);
+      rhs.SetSize(N * nc);
+      HDGReconAssemble(z0, nc, NU, NP, NFE, TRD, TRUT, NDUT, NPC, have_pot,
+                       Mu, Bd,
+                       Ct, Pf, side, NQE, we, phe, dve, ge.DetJ(), NQF, wf, trf,
+                       utf, NQC, wc, phc, pcc, gc.DetJ(), ut_evd, ut_fvd, pc_vd,
+                       ut, pc, A, rhs);
+      BatchedLinAlg::LUFactor(A, piv);
+      BatchedLinAlg::LUSolve(A, piv, rhs);
+      HDGReconScatter(z0, nc, NU, NP, NFE, TRD, u_vd, p_vd, el_face, owner,
+                      tr_vd, rhs, u, p, tr);
+   }
+   return true;
 }
 
 void DarcyForm::EliminateTrueDofsInRHS(const Array<int> &tdofs_flux,

@@ -1469,6 +1469,11 @@ private:
                                     const DenseMatrix &G);
    void AssembleNCSlaveHFaceMatrix(int f, const DenseMatrix &H);
    void ConstructC();
+   /** @brief ConstructC()'s interior faces through
+       HDGNormalTraceJumpBatched(), thresholded at @a mtol and compacted as
+       AssembleCtFaceMatrix() does. False, having done nothing, unless
+       CanBatchConstraintAssembly(). */
+   bool ConstructCInteriorBatched(real_t mtol);
    void AllocD() const;
    void AllocEG() const;
    void AllocH() const;
@@ -2453,6 +2458,25 @@ public:
    /// The mode set by SetAssemblyMode().
    AssemblyMode GetAssemblyMode() const { return asm_mode; }
 
+   /** @brief The AssemblyMode every DarcyHybridization constructed AFTER this
+       call starts in, process-wide; Serial until changed.
+
+       It exists for the one batched leg that runs before a caller can reach
+       SetAssemblyMode(): DarcyForm::EnableHybridization() constructs the
+       hybridization and calls Init() in the same breath, and Init() builds
+       the flux constraint C (ConstructC()). By the time the caller holds the
+       object, C has been assembled face by face on the host -- 0.53 s of meq's
+       first assembly on 154k interior faces, single-threaded under a Device.
+       Setting the default to Batched first lets that leg take
+       HDGNormalTraceJumpBatched() (see CanBatchConstraintAssembly()).
+
+       Validated exactly as SetAssemblyMode() validates, at construction, so a
+       default of Threaded aborts in a build that cannot honour it. A test that
+       changes it restores it. */
+   static void SetDefaultAssemblyMode(AssemblyMode mode);
+   /// The mode set by SetDefaultAssemblyMode().
+   static AssemblyMode GetDefaultAssemblyMode();
+
    /** @brief Assert that every nonlinear integrator installed on the forms
        this hybridization reads is safe to evaluate from several threads at
        once, licensing AssemblyMode::Threaded where it would otherwise be
@@ -2687,6 +2711,17 @@ public:
        than what the mode costs. A silent fallback is the normal case here,
        so a caller that cares has to be able to ask. */
    bool CanBatchPotFaceAssembly() const;
+
+   /** @brief Whether ConstructC() assembles the INTERIOR faces' flux
+       constraint with HDGNormalTraceJumpBatched().
+
+       It needs AssemblyMode::Batched AT INIT() -- which in practice means
+       SetDefaultAssemblyMode(), since DarcyForm::EnableHybridization() calls
+       Init() before returning -- and a constraint integrator and spaces that
+       HDGNormalTraceJumpCanBatch() takes. Shared faces and the boundary
+       constraint integrators keep their per-face loops either way. Asked of
+       the spaces and the mesh, so it builds no transformation. */
+   bool CanBatchConstraintAssembly() const;
 
    /** @brief Whether AssembleNLFaceGradBatched() would actually be taken.
 
@@ -3174,7 +3209,26 @@ public:
        Measured on an RTX 2070 at meq's size (4802 triangles, k = 2, 14
        columns, 12 steps), the three changes of that commit together took
        host-to-device traffic from 669 MB to 271 MB with every output bitwise
-       unchanged. */
+       unchanged.
+
+       **@a leave names arrays the call does not touch at all**: neither made
+       readable nor taken over, so a device-only copy stays device-only. It
+       is for a site where no host code reads them before the next kernel,
+       and it moves the duty to sync onto whichever host reader does come.
+       One site uses it: ComputeH() after the fully batched gradient leaves
+       #LB_FLUX, #LB_POT and #LB_FACTORS, i.e. A's and D's factors and their
+       pivots. Their only host readers are the per-element MultInv() and
+       MultInvBlocked(), and every loop that calls one now syncs first
+       (MultNL() already did; ReduceRHS(), ComputeSolution(), NPCReduce() and
+       NPCRecover(), both overloads each, on their per-element branches). On
+       the batched branches nothing on the host reads them: the next readers
+       are MultInvBatched() and the next factorisation. meq measured the
+       readback this removes at 24 MB of 38 MB down over a run (4848
+       triangles, k = 2, 12 gradients): D's factors at every gradient and A's
+       once. The face blocks, Ct and Bf are still read, because
+       ReduceRHS()'s and ReconstructTotalFlux()'s face loops index them raw
+       on every route; dropping the whole call faults there under
+       Device("debug"). */
    enum LocalBlockSet : unsigned
    {
       LB_NONE    = 0,
@@ -3185,7 +3239,8 @@ public:
       LB_FACTORS = 1u << 4,  ///< Af_ipiv, Df_ipiv, Sf_data, Sf_ipiv
       LB_ALL     = 0x1fu
    };
-   void SyncLocalBlocksToHost(unsigned own = LB_ALL) const;
+   void SyncLocalBlocksToHost(unsigned own = LB_ALL,
+                              unsigned leave = LB_NONE) const;
 
    /** @brief Choose how the element-local blocks A and D are factored.
        LocalFactorMode::Serial by default, so nothing existing changes.
@@ -5088,6 +5143,41 @@ public:
    */
    void ReconstructTotalFlux(const BlockVector &sol, const Vector &sol_r,
                              total_flux_sys_fun ut_fx, GridFunction &ut) const;
+
+   /** @brief Whether ReconstructTotalFluxBatched() can serve @a fes_ut.
+
+       AssemblyMode::Batched; serial; a flux constraint
+       HDGNormalTraceJumpCanBatch() takes and a potential constraint -- interior
+       and boundary -- HDGFaceSideCanBatch() takes, none of it nonlinear; no
+       essential flux dofs; and a scalar RT total flux space without a
+       DofTransformation. Asked of the spaces and the integrators, so it
+       builds no transformation. */
+   bool CanBatchReconstructTotalFlux(const FiniteElementSpace &fes_ut) const;
+
+   /** @brief ReconstructTotalFlux() for the IDENTITY flux law -- the total
+       flux is the flux, as on a problem with no convective or hyperbolic
+       term -- in two kernels: one thread per face for the face dofs, one per
+       element for the interior ones.
+
+       The face pass is the host route's arithmetic: C^T u from the stored C
+       (a kernel-built block on a boundary face, where ConstructC() stores
+       none), the potential constraint's trace rows G p + H x one side at a
+       time, then the face mass solve and the halving of an interior face.
+       One difference, and it is round-off: the face mass is inverted ONCE.
+       MassIntegrator between the INTEGRAL-mapped total-flux face element and
+       the VALUE-mapped trace one has the transformation weight cancel between
+       the map and the measure, so every face of one geometry has that matrix.
+
+       The element pass takes its geometry from HDGElementGeometry and its
+       shapes from reference tables, so nothing in it is a host loop over
+       elements but the index maps and, on a mesh without nodes, the packing
+       of each element's vertices.
+
+       Leaves @a ut wherever the kernels ran -- on the device under one -- and
+       returns false, having done nothing, unless
+       CanBatchReconstructTotalFlux(). */
+   bool ReconstructTotalFluxBatched(const BlockVector &sol, const Vector &sol_r,
+                                    GridFunction &ut) const;
 
    /// Reconstruct the total flux of a single field.
    /** Equivalent to the overload above with a one-entry potential; provided so

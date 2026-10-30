@@ -1337,3 +1337,104 @@ TEST_CASE("DenseTensor arithmetic", "[DenseTensor]")
       }
    }
 }
+
+namespace
+{
+
+/// A batch of @a n_mat diagonally dominant n x n matrices, distinct per @a seed.
+DenseTensor MakeBatch(int n, int n_mat, int seed)
+{
+   DenseTensor A(n, n, n_mat);
+   for (int i = 0; i < n_mat; ++i)
+   {
+      DenseMatrix &Ai = A(i);
+      for (int j = 0; j < n; ++j)
+      {
+         Vector col;
+         Ai.GetColumnReference(j, col);
+         col.Randomize(seed + 7*i + j);
+         Ai(j, j) += n + 1;
+      }
+   }
+   return A;
+}
+
+/// Solve with the factors @a LU of @a A and check against DenseMatrixInverse.
+void CheckSolve(const BatchedLinAlgBase &la, const DenseTensor &A,
+                const DenseTensor &LU, const Array<int> &P, int seed)
+{
+   const int n = A.SizeI(), n_mat = A.SizeK(), n_rhs = 2;
+   Vector x(n * n_rhs * n_mat);
+   x.Randomize(seed);
+   Vector b(x);
+   la.LUSolve(LU, P, x);
+   x.HostRead();
+   for (int i = 0; i < n_mat; ++i)
+   {
+      DenseMatrix Ai(A(i));
+      for (int j = 0; j < n_rhs; ++j)
+      {
+         Vector bj(b.GetData() + n*(j + n_rhs*i), n), want(n);
+         DenseMatrixInverse(Ai).Mult(bj, want);
+         for (int k = 0; k < n; ++k)
+         {
+            REQUIRE(x[k + n*(j + n_rhs*i)] == MFEM_Approx(want(k), 1e-10));
+         }
+      }
+   }
+}
+
+} // namespace
+
+TEST_CASE("Batched LU across calls of different sizes and batches",
+          "[DenseMatrix][GPU]")
+{
+   // A backend may keep its work arrays between calls (GPU_BLAS keeps its
+   // pointer and info arrays). Every call must still use its own batch: the
+   // batch count grows and shrinks here, two batches share a count, and the
+   // factors are solved with out of order.
+   auto backend = GENERATE(BatchedLinAlg::NATIVE,
+                           BatchedLinAlg::GPU_BLAS,
+                           BatchedLinAlg::MAGMA);
+   if (!BatchedLinAlg::IsAvailable(backend)) { return; }
+   CAPTURE(backend);
+   const BatchedLinAlgBase &la = BatchedLinAlg::Get(backend);
+
+   const int n = 4;
+   const int counts[] = {5, 41, 2, 41};
+   std::vector<DenseTensor> A, LU;
+   std::vector<Array<int>> P(4);
+   A.reserve(4);
+   LU.reserve(4);
+   for (int c = 0; c < 4; ++c)
+   {
+      A.push_back(MakeBatch(n, counts[c], 100*c));
+      LU.push_back(A.back());
+      la.LUFactor(LU.back(), P[c]);
+   }
+   for (int c : {3, 0, 1, 2, 1, 3})
+   {
+      CAPTURE(c);
+      CheckSolve(la, A[c], LU[c], P[c], 1000 + c);
+   }
+
+   // Inverses, interleaved with solves.
+   for (int c : {1, 2, 3})
+   {
+      CAPTURE(c);
+      DenseTensor Ainv(A[c]);
+      la.Invert(Ainv);
+      CheckSolve(la, A[c], LU[c], P[c], 2000 + c);
+      Ainv.HostRead();
+      for (int i = 0; i < counts[c]; ++i)
+      {
+         DenseMatrix I(n);
+         Mult(Ainv(i), A[c](i), I);
+         for (int j = 0; j < n; ++j)
+            for (int k = 0; k < n; ++k)
+            {
+               REQUIRE(I(j, k) == MFEM_Approx(j == k ? 1.0 : 0.0));
+            }
+      }
+   }
+}
