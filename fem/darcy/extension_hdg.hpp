@@ -225,7 +225,7 @@ public:
 
 
 /** @brief The path family issuing along the outward normal of @f$\Gamma_h@f$,
-    terminated on the zero level set by bisection.
+    terminated on the zero level set by a bracketed search (Brent's method).
 
     This is the family the a priori error analysis is written for: its paths
     are parallel to the face normal, which satisfies the sign condition
@@ -255,15 +255,16 @@ public:
        @param tol_            how far outside @f$\Gamma@f$, as a fraction of
                               @a search_length_, the start of a path may lie
                               and still count as on it. **It does not stop the
-                              bisection**, which always runs until its
-                              midpoint stops moving: a bisection stopped short
+                              search**, which always runs to the resolution of
+                              the endpoint itself: a search stopped short
                               makes the endpoint a staircase in the face
                               point, which a central difference along the
                               face amplifies (MEQ, 2026-10-28). The same holds
                               for every family here that takes a @a tol_.
-       @param max_iter_       a cap on the bisection's halvings; double needs
-                              about 45 from a bracket of a thirty-second of
-                              the search. */
+       @param max_iter_       a cap on the level-set evaluations after the
+                              sign change is bracketed. Brent's method needs
+                              about ten in double where the bisection it
+                              replaced needed about 45. */
    LevelSetPath(PositionFunction phi_, real_t search_length_,
                 int search_steps_ = 1, real_t tol_ = 1e-13,
                 int max_iter_ = 100)

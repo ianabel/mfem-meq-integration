@@ -801,6 +801,11 @@ void DarcyForm::Assemble(int skip_zeros)
          // AssembleFluxMassMatricesBatched().
          if (!hybridization->AssembleFluxMassMatricesBatched(M_u.get()))
          {
+            // Host code accumulating into A and Ae through raw pointers, which
+            // ZeroBlocksOnDevice() may have zeroed on the device: taken first,
+            // as every host assembly loop is. Outside the parallel region.
+            hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_FLUX |
+                                                 DarcyHybridization::LB_ELIM);
             const bool threaded = CanThreadAssembly();
             const int NE = fes_u->GetNE();
 
@@ -880,6 +885,8 @@ void DarcyForm::Assemble(int skip_zeros)
          // miss; see EnableHybridization().
          if (!hybridization->AssembleDivMatricesBatched(B.get()))
          {
+            // B and Be, taken first; see the flux mass.
+            hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_DIV);
             const bool threaded = CanThreadAssembly();
             const int NE = fes_u->GetNE();
 
@@ -941,6 +948,8 @@ void DarcyForm::Assemble(int skip_zeros)
          // routed separately. See AssemblePotMassMatricesBatched().
          if (!hybridization->AssemblePotMassMatricesBatched(M_p.get()))
          {
+            // D, taken first; see the flux mass.
+            hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_POT);
             const bool threaded = CanThreadAssembly();
             const int NE = fes_p->GetNE();
 
@@ -3660,7 +3669,10 @@ void DarcyForm::AssembleFluxMassBdrFaces(int skip_zeros)
       // there. Measured, with the gate forced false by a probe while work was
       // admitted: without this line the fault lands inside
       // DarcyHybridization::AssembleFluxMassMatrix() under Device("debug").
-      hybridization->SyncLocalBlocksToHost();
+      // Exactly what it writes, A and Ae; Ae was only made readable here
+      // until the blocks were zeroed on the device (#LB_ELIM).
+      hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_FLUX |
+                                           DarcyHybridization::LB_ELIM);
 
       Array<Array<int>*> &boundary_face_integs_marker = *M_u->GetBFBFI_Marker();
       Mesh *mesh = fes_u->GetMesh();
@@ -3732,7 +3744,15 @@ void DarcyForm::AssembleFluxMassBdrFaces(int skip_zeros)
    // all: the element pass alone can have left the blocks device-valid, and
    // ComputeH() syncs only under LocalFactorMode::Batched, so nothing further
    // down guarantees it.
-   hybridization->SyncLocalBlocksToHost();
+   //
+   // Owning nothing, and reading only Ae. Taking everything here is what used
+   // to stop a host pass leaving a stale device copy behind; the host passes
+   // now take what they write before writing, so the device copies stay valid
+   // and the next kernel uploads nothing. A is LEFT: its host readers sync
+   // for themselves. See SyncLocalBlocksToHost().
+   hybridization->SyncLocalBlocksToHost(
+      DarcyHybridization::LB_NONE,
+      DarcyHybridization::LB_EVERY & ~DarcyHybridization::LB_ELIM);
 }
 
 void DarcyForm::AssemblePotHDGFaces(int skip_zeros)
@@ -3744,6 +3764,10 @@ void DarcyForm::AssemblePotHDGFaces(int skip_zeros)
    if (hybridization->GetPotConstraintIntegrator() &&
        !hybridization->AssemblePotFaceMatricesBatched())
    {
+      // E, G, H and D, written through raw pointers; taken first, as in
+      // Assemble().
+      hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_FACE |
+                                           DarcyHybridization::LB_POT);
       int nfaces = mesh->GetNumFaces();
       for (int f = 0; f < nfaces; f++)
       {
@@ -3777,6 +3801,11 @@ void DarcyForm::AssemblePotHDGFaces(int skip_zeros)
    if (num_boundary_face_integs > 0 &&
        !hybridization->AssemblePotBdrFaceMatricesBatched())
    {
+      // As for the interior pass, and needed even when that pass was the host
+      // one: a batched interior pass leaves the face blocks on the device.
+      hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_FACE |
+                                           DarcyHybridization::LB_POT);
+
       // Which boundary attributes need to be processed?
       Array<int> bdr_attr_marker(mesh->bdr_attributes.Size() ?
                                  mesh->bdr_attributes.Max() : 0);
@@ -3828,7 +3857,12 @@ void DarcyForm::AssemblePotHDGFaces(int skip_zeros)
    // Once, after BOTH passes. Either may have been a device kernel, and
    // everything downstream -- ComputeElementH(), the face loops, the boundary
    // flux pass -- reads E, G, H and D through raw pointers, which do not sync.
-   hybridization->SyncLocalBlocksToHost();
+   // Owning nothing, as at the end of the flux mass group: the host passes
+   // took what they wrote before writing it. E, G and H made readable, and D
+   // left, its host readers syncing for themselves.
+   hybridization->SyncLocalBlocksToHost(
+      DarcyHybridization::LB_NONE,
+      DarcyHybridization::LB_EVERY & ~DarcyHybridization::LB_FACE);
 }
 
 void DarcyForm::AllocBlockOp(bool nonconforming)

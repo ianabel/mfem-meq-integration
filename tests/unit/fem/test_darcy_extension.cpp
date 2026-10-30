@@ -1651,12 +1651,15 @@ TEST_CASE("Extension from subdomains: the closest-point map of a sphere",
 TEST_CASE("Extension from subdomains: the bisection stops when it can no "
           "longer move", "[DarcyExtension]")
 {
-   // FirstCrossing() bisects to an absolute bracket of tol * length. In single
-   // precision the 1e-13 default is below what the format can represent, so
-   // the loop used to run to max_iter on every ray, at the right answer but
-   // three times the cost (MEQ: 27 s of setup against 9). This is the same
-   // situation in double: a tolerance no double bracket can reach, with a
-   // large cap, counted in level-set calls.
+   // FirstCrossing() bisected to an absolute bracket of tol * length. In
+   // single precision the 1e-13 default is below what the format can
+   // represent, so the loop used to run to max_iter on every ray, at the
+   // right answer but three times the cost (MEQ: 27 s of setup against 9).
+   // This is the same situation in double: a tolerance no double bracket can
+   // reach, with a large cap, counted in level-set calls. The search is now
+   // Brent's method stopping at the endpoint's resolution whatever tol is,
+   // and on this linear level set it needs one or two calls after the march;
+   // the bounds below are the bisection's and still hold.
    int calls = 0;
    auto phi = [&calls](const Vector &y) { calls++; return y(0) - 0.3719; };
 
@@ -3659,6 +3662,61 @@ TEST_CASE("Extension from subdomains: the bisection runs to the format's "
    REQUIRE(differ == 0);
    // The resolution along a ray from |x| <= 1 over L, with a few ulps for
    // DiscPhi's own sqrt. The 1e-10 bracket here would leave up to 2.5e-11.
+   REQUIRE(worst_phi <= 8. * eps * (1. + L));
+}
+
+TEST_CASE("Extension from subdomains: the crossing search reaches round-off "
+          "in a handful of level-set calls", "[DarcyExtension]")
+{
+   // FirstCrossing() bisected its bracket until the midpoint stopped moving,
+   // about 50 level-set calls per endpoint in double, which resolved the
+   // crossing to t's own ulps, finer than the endpoint can be. In meq's form
+   // build those calls were 12% of the wall time. It now runs Brent's method
+   // to the endpoint's resolution. This counts the calls on the disc, one
+   // march step so that the march is two calls, and requires the endpoint to
+   // stay on Gamma to what the format resolves, as the case above does.
+   using namespace darcy_extension;
+
+   const int n = 16;
+   Subdomain s = BuildSubdomain(n);
+   const real_t L = 4.0 / n;
+   long calls = 0;
+   PositionFunction counted = [&calls](const Vector &y)
+   {
+      calls++;
+      return DiscPhi(y);
+   };
+   LevelSetPath path(counted, L, 1);
+   const real_t eps = std::numeric_limits<real_t>::epsilon();
+
+   const IntegrationRule &ir = IntRules.Get(Geometry::SEGMENT, 8);
+   Vector a, x;
+   int points = 0;
+   long worst_calls = 0, total_calls = 0;
+   real_t worst_phi = 0.;
+   for (int be = 0; be < s.D_h->GetNBE(); be++)
+   {
+      if (s.D_h->GetBdrAttribute(be) != s.gamma_h_attr) { continue; }
+      FaceElementTransformations *FTr = s.D_h->GetBdrFaceTransformations(be);
+      if (!FTr) { continue; }
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         FTr->SetAllIntPoints(&ip);
+         FTr->Transform(ip, x);
+         REQUIRE(DiscPhi(x) < 0.);
+         calls = 0;
+         path.Endpoint(*FTr, ip, a);
+         worst_calls = std::max(worst_calls, calls);
+         total_calls += calls;
+         worst_phi = std::max(worst_phi, std::abs(DiscPhi(a)));
+         points++;
+      }
+   }
+   CAPTURE(points, worst_calls, total_calls, worst_phi);
+   REQUIRE(points > 0);
+   // Two for the march, then the search. The bisection took about 50 here.
+   REQUIRE(worst_calls <= 16);
    REQUIRE(worst_phi <= 8. * eps * (1. + L));
 }
 

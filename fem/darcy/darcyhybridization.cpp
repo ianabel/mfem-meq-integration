@@ -89,6 +89,46 @@ DarcyHybridization::AssemblyMode DarcyHybridization::GetDefaultAssemblyMode()
    return default_asm_mode;
 }
 
+/** @brief Zero @a n entries at @a d, on the device when @a on_dev. A free
+    function for the nvcc reason on TransposeBlocksScaled(); the two
+    overloads below hand it the pointer their container's Write() returns,
+    which is what marks the zeroed side as the only valid one. */
+static void HDGZeroBlockData(real_t *d, int n, bool on_dev)
+{
+   mfem::forall_switch(on_dev, n, [=] MFEM_HOST_DEVICE (int i) { d[i] = 0.0; });
+}
+
+/// A local block array, zeroed where the next writer will write it.
+static void HDGZeroBlocks(Vector &a, bool on_dev)
+{
+   HDGZeroBlockData(a.Write(on_dev), a.Size(), on_dev);
+}
+
+/// The same for Hybridization::Af_data, which is an Array<real_t>.
+static void HDGZeroBlocks(Array<real_t> &a, bool on_dev)
+{
+   HDGZeroBlockData(a.Write(on_dev), a.Size(), on_dev);
+}
+
+/** @brief `dst = src` for a backup of a local block array, on the device when
+    @a src is valid there. Finalize() takes these just before the blocks are
+    factored in place, and on the batched route both the factorisation and
+    the consumers of the backup are kernels. A host copy then wrote the
+    backup into fresh host pages (meq's ff3: 118 MB for A), and the first
+    kernel to read it uploaded it again. A device copy leaves the backup valid
+    on the device only. Its host readers sync for themselves:
+    SyncLocalBlocksToHost() reads both backups, and CopyLinearGradBlocks()
+    takes HostRead(). */
+template <typename T>
+static void HDGCopyBlocks(const T &src, T &dst)
+{
+   if (!src.GetMemory().DeviceIsValid()) { dst = src; return; }
+   const int n = src.Size();
+   dst.SetSize(n);
+   dst.Write();   // the destination's valid side, before the copy picks one
+   dst.GetMemory().CopyFrom(src.GetMemory(), n);
+}
+
 /** @brief The connectivity TraceAssemblyMode::Batched assembles against.
 
     Cached behind a pointer so that adding to it costs no rebuild anywhere;
@@ -470,7 +510,10 @@ void DarcyHybridization::Init(const Array<int> &ess_flux_tdof_list)
       Af_f_offsets[i+1] = Af_f_offsets[i] + f_size;
    }
 
-   Af_data.SetSize(Af_offsets[NE]); Af_data = 0.;
+   // Zeroed where the batched element kernel will accumulate into it; see
+   // ZeroBlocksOnDevice() and SyncLocalBlocksToHost().
+   const bool zero_dev = ZeroBlocksOnDevice();
+   Af_data.SetSize(Af_offsets[NE]); HDGZeroBlocks(Af_data, zero_dev);
    Af_ipiv.SetSize(Af_f_offsets[NE]);
 
    // Everything about a restricted flux that does NOT depend on EnableNPC()
@@ -510,7 +553,7 @@ void DarcyHybridization::Init(const Array<int> &ess_flux_tdof_list)
 #endif //MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
    }
 
-   Bf_data.SetSize(Bf_offsets[NE]); Bf_data = 0.;
+   Bf_data.SetSize(Bf_offsets[NE]); HDGZeroBlocks(Bf_data, zero_dev);
    // A nonlinear potential mass allocates D lazily, in ReducedGradient(),
    // because ConstructGrad() is what fills it. Anything assembled LINEARLY
    // into D needs it at assembly time instead, so it is allocated here when
@@ -527,11 +570,11 @@ void DarcyHybridization::Init(const Array<int> &ess_flux_tdof_list)
    // branch per element and nothing else.
    if (!m_nlfi_p || c_bfi_p)
    {
-      AllocD();
+      AllocD(zero_dev);
    }
 #ifdef MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
-   Ae_data.SetSize(Ae_offsets[NE]); Ae_data = 0.;
-   Be_data.SetSize(Be_offsets[NE]); Be_data = 0.;
+   Ae_data.SetSize(Ae_offsets[NE]); HDGZeroBlocks(Ae_data, zero_dev);
+   Be_data.SetSize(Be_offsets[NE]); HDGZeroBlocks(Be_data, zero_dev);
 #endif //MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
 
    AllocTraceBlocks();
@@ -551,10 +594,13 @@ void DarcyHybridization::AllocTraceBlocks()
 {
    if (c_bfi_p)
    {
-      AllocEG();
+      // Before any assembly, from Init() and from SetTraceOrders(), so where
+      // the kernels will write; see ZeroBlocksOnDevice().
+      const bool zero_dev = ZeroBlocksOnDevice();
+      AllocEG(zero_dev);
       if (NPCEnabled())
       {
-         AllocH();
+         AllocH(zero_dev);
       }
    }
 }
@@ -1292,38 +1338,91 @@ bool DarcyHybridization::AssembleFluxMassBdrMatricesBatched(BilinearForm *M_u,
    // AssembleFaceMatrix() takes a FaceElementTransformations and a
    // FiniteElement, neither of which carries any MFEM_HOST_DEVICE, so there
    // is nothing to move here and no family to dispatch on; see the doxygen.
+   //
+   // **THREADED, under a Device too, on SetIntegratorsThreadSafe().** meq
+   // profiled a form build on their ff3 case under CUDA: this loop was 14% of
+   // it on one core, nearly all inside an extension integrator's path search
+   // calling their level set. Each slot is written by one iteration and each
+   // thread builds its own transformations, so the integrators are the only
+   // shared objects, and the caller's promise is what covers them -- here as
+   // for the element loops, where the same promise lets a nonlinear
+   // integrator be entered from several threads. **The promise therefore
+   // covers the flux mass form's boundary face integrators as well, and an
+   // extension integrator's path, with whatever level set it calls.**
+   //
+   // ThreadHostLoops() refuses any Device, because MFEM's memory maps are not
+   // thread-safe and the element loops' per-thread scratch reaches them. This
+   // loop allocates only what the integrators allocate, and with the host
+   // memory type plain HOST -- every CUDA or HIP Device that does not ask for
+   // another -- a host allocation is new/delete and never enters a map. So
+   // the test here is that memory type rather than the Device. Under
+   // Device("debug"), whose host memory is registered, the loop stays serial.
+   // What the loop does READ that a kernel may have written is the mesh's
+   // nodes, which a transformation gathers per face; they are made readable
+   // once, outside the region, so that no thread moves them.
    {
-      DenseMatrix elmat;
+#if defined(MFEM_USE_OPENMP) && defined(MFEM_THREAD_SAFE) && \
+    defined(MFEM_DARCY_HYBRIDIZATION_ELIM_BCS)
+      const bool threaded = integ_thread_safe &&
+                            Device::GetHostMemoryType() == MemoryType::HOST;
+#else
+      const bool threaded = false;
+#endif
+      if (threaded && mesh->GetNodes()) { mesh->GetNodes()->HostRead(); }
       real_t *pw = pack.HostWrite();
-#ifndef MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
-      Array<int> vdofs;
-#endif //!MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
-      for (int c = 0; c < NC; c++)
+      ThreadedExceptionTrap trap;
+#ifdef MFEM_USE_OPENMP
+      #pragma omp parallel if (threaded)
+#endif
       {
-         const int e = elems[c];
-         const int a = hat_offsets[e+1] - hat_offsets[e];
-         FaceElementTransformations *ftr =
-            mesh->GetBdrFaceTransformations(bdr_els[c]);
-         const FiniteElement *fe1 = fes.GetFE(e);
-         // The second element is a dummy on a boundary face, as in the loop
-         // this replaces: never used, but a null reference cannot be formed.
-         bfbfi[integs[c]]->AssembleFaceMatrix(*fe1, *fe1, *ftr, elmat);
-         MFEM_VERIFY(elmat.Height() == fe1->GetDof() * vd &&
-                     elmat.Width() == elmat.Height() && elmat.Height() == a,
-                     "the flux mass boundary face integrator must return the "
-                     "block of the adjacent element alone");
-         const int o = poff[slot_of[c]];
-         for (int i = 0; i < a * a; i++) { pw[o + i] = elmat.GetData()[i]; }
+         DenseMatrix elmat;
+         // Per thread, as GetBdrFaceTransformations(int)'s own are per mesh:
+         // that overload fills these same three through the overload below.
+         FaceElementTransformations ftr;
+         IsoparametricTransformation tr1, tr2;
 #ifndef MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
-         // The sparse flux mass, which the loop this replaces accumulates
-         // into on the same pass. Host sparse work either way, and the
-         // element kernels above simply drop it -- unreachable, since
-         // MFEM_DARCY_HYBRIDIZATION_ELIM_BCS is defined unconditionally at
-         // the top of darcyhybridization.hpp, but not a gap worth copying.
-         fes.GetElementVDofs(e, vdofs);
-         M_u->SpMat().AddSubMatrix(vdofs, vdofs, elmat, skip_zeros);
+         Array<int> vdofs;
 #endif //!MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
+#ifdef MFEM_USE_OPENMP
+         // Dynamic: a path search's cost varies with the face.
+         #pragma omp for schedule(dynamic, 8)
+#endif
+         for (int c = 0; c < NC; c++)
+         {
+            if (trap.Raised()) { continue; }
+            try
+            {
+               const int e = elems[c];
+               const int a = hat_offsets[e+1] - hat_offsets[e];
+               mesh->GetBdrFaceTransformations(bdr_els[c], ftr, tr1, tr2);
+               const FiniteElement *fe1 = fes.GetFE(e);
+               // The second element is a dummy on a boundary face, as in the
+               // loop this replaces: never used, but a null reference cannot
+               // be formed.
+               bfbfi[integs[c]]->AssembleFaceMatrix(*fe1, *fe1, ftr, elmat);
+               MFEM_VERIFY(elmat.Height() == fe1->GetDof() * vd &&
+                           elmat.Width() == elmat.Height() &&
+                           elmat.Height() == a,
+                           "the flux mass boundary face integrator must return "
+                           "the block of the adjacent element alone");
+               const int o = poff[slot_of[c]];
+               const real_t *ed = elmat.GetData();
+               for (int i = 0; i < a * a; i++) { pw[o + i] = ed[i]; }
+#ifndef MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
+               // The sparse flux mass, which the loop this replaces
+               // accumulates into on the same pass. Host sparse work either
+               // way, and the element kernels above simply drop it --
+               // unreachable, since MFEM_DARCY_HYBRIDIZATION_ELIM_BCS is
+               // defined unconditionally at the top of darcyhybridization.hpp,
+               // but not a gap worth copying. Never threaded: see above.
+               fes.GetElementVDofs(e, vdofs);
+               M_u->SpMat().AddSubMatrix(vdofs, vdofs, elmat, skip_zeros);
+#endif //!MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
+            }
+            catch (...) { trap.Capture(); }
+         }
       }
+      trap.Rethrow();
    }
    MFEM_CONTRACT_VAR(skip_zeros);
 
@@ -1427,8 +1526,10 @@ bool DarcyHybridization::AssemblePotMassMatricesBatched(BilinearForm *M_p)
 
    // As for the flux: AssemblePotHDGFaces() follows, and its boundary pass is
    // host code accumulating into D whenever the boundary kernel is refused --
-   // which is most of the time.
-   SyncLocalBlocksToHost();
+   // which is most of the time. That pass takes D itself, and D's other host
+   // readers sync for themselves, so this leaves the blocks where they are;
+   // see SyncLocalBlocksToHost().
+   SyncLocalBlocksToHost(LB_NONE, LB_EVERY);
    return true;
 }
 
@@ -1504,8 +1605,10 @@ bool DarcyHybridization::AssembleDivMatricesBatched(MixedBilinearForm *B)
 #endif //MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
 
    // AssembleDivLDGFaces() and the potential mass loop follow, both host code
-   // reading these through raw pointers; see the flux mass.
-   SyncLocalBlocksToHost();
+   // reading these through raw pointers; see the flux mass. B and Be made
+   // readable and nothing else: the potential mass loop takes what it writes
+   // itself.
+   SyncLocalBlocksToHost(LB_NONE, LB_EVERY & ~LB_DIV);
    return true;
 }
 
@@ -2325,8 +2428,10 @@ bool DarcyHybridization::AssemblePotSharedFaceMatricesBatched()
    // happened, and nothing follows it. Leaving it out is not a warning: under
    // Device("debug") the first host reader faults inside
    // AssemblePotMassMatrix(), naming neither the array nor the routine that
-   // left it there, and under CUDA it does not fault at all.
-   SyncLocalBlocksToHost();
+   // left it there, and under CUDA it does not fault at all. The face blocks
+   // made readable and D left, as at the end of DarcyForm's face group; see
+   // SyncLocalBlocksToHost().
+   SyncLocalBlocksToHost(LB_NONE, LB_EVERY & ~LB_FACE);
 
    return true;
 }
@@ -3161,14 +3266,14 @@ void DarcyHybridization::SyncLocalBlocksToHost(unsigned own,
    sync(LB_FACE, H_data);
    sync(LB_FLUX, Af_data);
    sync(LB_FACTORS, Af_ipiv);
-   if (Bf_data.Size()) { Bf_data.HostRead(); }
+   sync(LB_DIV, Bf_data);
 #ifdef MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
    // The ELIMINATED blocks, which the batched flux mass writes alongside Af
    // and which EliminateVDofsInRHS() reads on the host. They were missing
    // from this list and the debug backend faulted on Ae the first time the
    // mass kernel ran with a Device configured.
-   if (Ae_data.Size()) { Ae_data.HostRead(); }
-   if (Be_data.Size()) { Be_data.HostRead(); }
+   sync(LB_ELIM, Ae_data);
+   sync(LB_DIV, Be_data);
 #endif //MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
    sync(LB_BNL, Bnl_data);
    sync(LB_POT, Df_data);
@@ -3177,17 +3282,21 @@ void DarcyHybridization::SyncLocalBlocksToHost(unsigned own,
    // (ConstructGrad()'s `D += D_lin`, ComputeElementH() under FluxNL, the
    // `Df_data += Df_lin_data` kernel) only read it.
    if (Df_lin_data.Size()) { Df_lin_data.HostRead(); }
+   // A's backup the same way, which Finalize() now copies on the device when
+   // A is valid there (HDGCopyBlocks()). Left with A when @a leave names
+   // #LB_FLUX: its readers are A's.
+   if (Af_lin_data.Size() && !(leave & LB_FLUX)) { Af_lin_data.HostRead(); }
    sync(LB_FACTORS, Df_ipiv);
    sync(LB_FACTORS, Sf_data);
    sync(LB_FACTORS, Sf_ipiv);
-   // Ct_data, Ae_data, Bf_data and Be_data stay on HostRead() above, and it
-   // is a declaration of scope rather than a judgement that they are safe:
-   // they are not `mutable`, so a const method cannot take ownership of
-   // them, and unlike the blocks above nothing rewrites them on the host
-   // BETWEEN two kernel passes -- Ct is built once in ConstructC() and the
-   // other three at Assemble() time. A host loop that ever does rewrite one
-   // of them between two device passes has this defect and will need the
-   // same treatment.
+   // Ct_data stays on HostRead() above, and it is a declaration of scope
+   // rather than a judgement that it is safe: it is not `mutable`, so a const
+   // method cannot take ownership of it, and nothing rewrites it on the host
+   // BETWEEN two kernel passes -- ConstructC() builds it once and takes it
+   // itself when a host pass follows its kernel. Ae_data, Bf_data and
+   // Be_data were in the same position until the blocks started being
+   // zeroed on the device, which made the host assembly fallbacks raw
+   // writers after a device write. They now name #LB_ELIM and #LB_DIV.
 }
 
 void DarcyHybridization::BuildElementColouring() const
@@ -4123,13 +4232,13 @@ bool DarcyHybridization::ConstructCInteriorBatched(real_t mtol)
    return true;
 }
 
-void DarcyHybridization::AllocD() const
+void DarcyHybridization::AllocD(bool on_dev) const
 {
-   Df_data.SetSize(Df_offsets.Last()); Df_data = 0.;
+   Df_data.SetSize(Df_offsets.Last()); HDGZeroBlocks(Df_data, on_dev);
    Df_ipiv.SetSize(Df_f_offsets.Last());
 }
 
-void DarcyHybridization::AllocEG() const
+void DarcyHybridization::AllocEG(bool on_dev) const
 {
    Mesh *mesh = fes.GetMesh();
    const int num_faces = mesh->GetNumFaces();
@@ -4155,11 +4264,11 @@ void DarcyHybridization::AllocEG() const
       E_offsets[f+1] = E_offsets[f] + c_size * d_size;
    }
 
-   E_data.SetSize(E_offsets.Last()); E_data = 0.;
-   G_data.SetSize(G_offsets.Last()); G_data = 0.;
+   E_data.SetSize(E_offsets.Last()); HDGZeroBlocks(E_data, on_dev);
+   G_data.SetSize(G_offsets.Last()); HDGZeroBlocks(G_data, on_dev);
 }
 
-void DarcyHybridization::AllocH() const
+void DarcyHybridization::AllocH(bool on_dev) const
 {
    Mesh *mesh = fes.GetMesh();
    int num_faces = mesh->GetNumFaces();
@@ -4173,7 +4282,7 @@ void DarcyHybridization::AllocH() const
       H_offsets[f+1] = H_offsets[f] + c_size * c_size;
    }
 
-   H_data.SetSize(H_offsets[num_faces]); H_data = 0.;
+   H_data.SetSize(H_offsets[num_faces]); HDGZeroBlocks(H_data, on_dev);
 }
 
 int DarcyHybridization::UniformBlockSize(const Array<int> &f_offsets, int NE)
@@ -4257,6 +4366,12 @@ void DarcyHybridization::InvertA()
       return;
    }
 
+   // The host factorisation writes A and its pivots in place through raw
+   // pointers, and the assembly may have left A valid on the device: its end
+   // syncs only make the blocks readable. So it takes them first, as every
+   // raw writer does; see SyncLocalBlocksToHost().
+   Af_data.HostReadWrite();
+   Af_ipiv.HostReadWrite();
    for (int el = 0; el < NE; el++)
    {
       int a_dofs_size = Af_f_offsets[el+1] - Af_f_offsets[el];
@@ -4276,7 +4391,8 @@ void DarcyHybridization::InvertD()
 #ifdef MFEM_DEBUG
    // Checked for every element whichever way the factorisation is done, so
    // that the two modes fail on the same inputs as well as agreeing on the
-   // rest.
+   // rest. A read: the assembly may have left D valid on the device only.
+   Df_data.HostRead();
    for (int el = 0; el < NE; el++)
    {
       const int d_dofs_size = Df_f_offsets[el+1] - Df_f_offsets[el];
@@ -4307,6 +4423,9 @@ void DarcyHybridization::InvertD()
       return;
    }
 
+   // Taken first, as in InvertA().
+   Df_data.HostReadWrite();
+   Df_ipiv.HostReadWrite();
    for (int el = 0; el < NE; el++)
    {
       int d_dofs_size = Df_f_offsets[el+1] - Df_f_offsets[el];
@@ -9162,8 +9281,9 @@ void DarcyHybridization::Finalize()
           && !c_nlfi)
       {
          lop_type = LocalOpType::PotNL;
-         // backup the data for gradient construction
-         Af_lin_data = Af_data;
+         // backup the data for gradient construction; on the device when A
+         // is there, see HDGCopyBlocks()
+         HDGCopyBlocks(Af_data, Af_lin_data);
          // The potential mass is the nonlinear one, so Df_data is about to
          // become the DESTINATION for its per-element Jacobian -- ConstructGrad()
          // zeroes it. Anything already assembled there has to survive.
@@ -9181,7 +9301,7 @@ void DarcyHybridization::Finalize()
          // further term. Without it that contribution is silently lost after
          // the first gradient, which is what the refusal in
          // SetPotMassNonlinearIntegrator() used to be avoiding.
-         if (!D_empty) { Df_lin_data = Df_data; }
+         if (!D_empty) { HDGCopyBlocks(Df_data, Df_lin_data); }
          InvertA();
       }
       else if (IsNonlinear() && !m_nlfi_p && !c_nlfi_p && !c_bfi_p && !D_empty
@@ -9189,7 +9309,7 @@ void DarcyHybridization::Finalize()
       {
          lop_type = LocalOpType::FluxNL;
          // backup the data for gradient construction
-         Df_lin_data = Df_data;
+         HDGCopyBlocks(Df_data, Df_lin_data);
          InvertD();
          // Df_data now holds the FACTORED linear potential mass, which the
          // local solve needs, so the Schur complement gets storage of its
@@ -14052,17 +14172,19 @@ void DarcyHybridization::Reset()
    G_lin_data.SetSize(0);
    H_lin_data.SetSize(0);
 
+   // Where the next assembly will write them, as in Init().
+   const bool zero_dev = ZeroBlocksOnDevice();
    A_empty = true;
-   Af_data = 0.;
-   Bf_data = 0.;
+   HDGZeroBlocks(Af_data, zero_dev);
+   HDGZeroBlocks(Bf_data, zero_dev);
    if (Df_data.Size())
    {
-      Df_data = 0.;
+      HDGZeroBlocks(Df_data, zero_dev);
       D_empty = true;
    }
 #ifdef MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
-   Ae_data = 0.;
-   Be_data = 0.;
+   HDGZeroBlocks(Ae_data, zero_dev);
+   HDGZeroBlocks(Be_data, zero_dev);
 #endif //MFEM_DARCY_HYBRIDIZATION_ELIM_BCS
 }
 

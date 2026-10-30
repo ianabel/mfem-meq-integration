@@ -497,11 +497,14 @@ private:
        class's. The two have to change type together, so both are left for a
        separate pass over fem/hybridization.hpp. */
    Array<real_t> Af_lin_data;
-   Vector Ae_data;
+   /// Mutable, as Bf_data and Be_data are, so that the const
+   /// SyncLocalBlocksToHost() can hand them to a host assembly loop; see
+   /// #LB_ELIM.
+   mutable Vector Ae_data;
    bool A_empty{true};
 
    Array<int> Bf_offsets, Be_offsets;
-   Vector Bf_data, Be_data;
+   mutable Vector Bf_data, Be_data;
 
    /** @brief The solution-dependent part of the local gradient's (0,1) block,
        d(flux residual)/dp.
@@ -1474,9 +1477,22 @@ private:
        AssembleCtFaceMatrix() does. False, having done nothing, unless
        CanBatchConstraintAssembly(). */
    bool ConstructCInteriorBatched(real_t mtol);
-   void AllocD() const;
-   void AllocEG() const;
-   void AllocH() const;
+   /** @brief Allocate and zero D, E and G, or H. The zero goes on the
+       device when @a on_dev, which Init() passes as ZeroBlocksOnDevice() and
+       nothing else does: the lazy calls sit inside host loops that write
+       straight after them. */
+   void AllocD(bool on_dev = false) const;
+   void AllocEG(bool on_dev = false) const;
+   void AllocH(bool on_dev = false) const;
+   /** @brief Whether Init() and Reset() zero the local blocks on the device:
+       under AssemblyMode::Batched with a device configured, where the
+       kernels will write them. A host loop that writes them instead takes
+       them first; see SyncLocalBlocksToHost(). */
+   bool ZeroBlocksOnDevice() const
+   {
+      return asm_mode == AssemblyMode::Batched &&
+             Device::Allows(Backend::DEVICE_MASK);
+   }
    /** @a AtFields and @a GradAtFields are the NPC modes: the flux and
        potential are Newton STATE, supplied in @a darcy_u and @a darcy_p, and
        no local solve, substitution or linearisation happens at all. Every
@@ -2562,6 +2578,17 @@ public:
        is a race, and setting this flag is the caller saying it is not one.
        Nothing else in this class asks the caller to vouch for a lambda.
 
+       **And the flux mass form's BOUNDARY FACE integrators, under a Device
+       too.** AssembleFluxMassBdrMatricesBatched() evaluates them on the host
+       and now threads that loop on this promise (meq's ff3: an extension
+       integrator's path searches were 14% of a CUDA form build, on one
+       core). An extension integrator brings its path and whatever level set
+       the path calls, so the promise covers those as well. Unlike the element
+       loops, this one runs threaded under a Device whose host memory type is
+       plain HOST: it allocates only what the integrators allocate, which is
+       new/delete there. So an integrator evaluated there must not move a
+       registered array between host and device either.
+
        **Why this exists rather than a predicate that decides for you.**
        MFEM has no way to ask an integrator whether it is reentrant. Its
        convention is to wrap scratch in `#ifndef MFEM_THREAD_SAFE`, which is a
@@ -3049,7 +3076,9 @@ public:
        This is a BILINEAR form, assembled once, and the blocks it writes are
        written by the kernel and never brought back for it -- which is what
        the paragraph below is about. What a device would save is a setup
-       cost, not a per-step one.
+       cost, not a per-step one. The integrator loop is THREADED on
+       SetIntegratorsThreadSafe(), including under a Device whose host memory
+       type is plain HOST; see there for what that promise now covers.
 
        That still buys the thing the loop cost: the block arrays are written
        by a kernel and are never brought to the host in the middle of the flux
@@ -3169,9 +3198,11 @@ public:
        HostRead() and both fail at every order.
 
        The cost is one upload per kernel pass, which is the upload that was
-       missing. Ct_data, Ae_data, Bf_data and Be_data are const members and
-       stay on HostRead(); see the note at the end of the body for what that
-       does and does not claim.
+       missing. Ct_data stays on HostRead(); see the note at the end of the
+       body for what that does and does not claim. Ae_data, Bf_data and
+       Be_data are taken over only when asked for by name (#LB_ELIM,
+       #LB_DIV), which #LB_ALL does not include: their only raw writers are
+       the assembly fallbacks.
 
        **@a own says which arrays the host code AFTER the call writes**, and
        only those are taken over; the rest are made readable and their device
@@ -3195,11 +3226,10 @@ public:
        taken everything; now it takes them itself. **The rule this leans on is
        that every raw-pointer writer is preceded by an owning sync of what it
        writes** -- the MultNL() loop by the first row, ComputeElementH() by
-       the third, the assembly routines by Reset()'s Vector zeroing and by
-       DarcyForm's sync at the end of each assembly group (which takes
-       everything, and invalidates a device copy the passes left stale before
-       any kernel reads it), InvertA()/InvertD() by running at Finalize().
-       A new raw writer has to join that list. Pinned by the debug-device
+       the third, every host assembly loop by a sync of exactly the sets it
+       writes, taken just before it, and the host branches of InvertA() and
+       InvertD() by their own. A new raw writer has to join that list.
+       Pinned by the debug-device
        cases "Two gradients in a row are the same operator under a device"
        (which fails with the first row's ownership dropped) and "The
        caller-integrand NPC gradient under a device" (which aborts with the
@@ -3210,6 +3240,33 @@ public:
        columns, 12 steps), the three changes of that commit together took
        host-to-device traffic from 669 MB to 271 MB with every output bitwise
        unchanged.
+
+       **The assembly loops own BEFORE they write, and the syncs at the end of
+       each assembly group take nothing, which is what lets the blocks stay on
+       a device.** Until meq profiled a form build under CUDA (ff3, 102,840
+       triangles), the rule was kept the other way round: Init() and Reset()
+       zeroed every block on the host, the host loops wrote into that, and
+       DarcyForm's sync at the end of each group took everything, so the
+       passes could never leave a stale device copy behind. Under
+       AssemblyMode::Batched that costs a round trip per array per form
+       build. Zeros were written on the host and uploaded, a kernel wrote the
+       blocks, and the end sync downloaded them and invalidated the device
+       copy. Finalize() then copied A on the host for the linear backup, and
+       InvertA() uploaded it again. On an RTX 2070 that was 492 MB up and
+       396 MB down, with host zero-fills and copies besides, in a build whose
+       kernels ran for 101 ms of 1.05 s. ZeroBlocksOnDevice() now zeroes where
+       the kernels will write, and each host loop takes its arrays first (a
+       download of zeros, on the routes that are host anyway). The end syncs
+       make readable only what their own group wrote and a host reader needs
+       without syncing for itself: Ae after the flux mass, B and Be after the
+       divergence, E, G and H after the faces. They LEAVE A and D, whose host
+       readers sync for themselves, as after ComputeH()'s batched gradient
+       below: the host factorisations take them, and MultNL() and the
+       per-element MultInv() loops read them. Reading everything was measured
+       first, and it was worse than the round trips it replaced. The end of
+       the flux mass group then downloaded the other groups' blocks while they
+       were still zeros, into host pages nothing had touched: 850 ms on the
+       RTX under WSL2.
 
        **@a leave names arrays the call does not touch at all**: neither made
        readable nor taken over, so a device-only copy stays device-only. It
@@ -3237,10 +3294,24 @@ public:
       LB_FACE    = 1u << 2,  ///< E_data, G_data, H_data
       LB_BNL     = 1u << 3,  ///< Bnl_data
       LB_FACTORS = 1u << 4,  ///< Af_ipiv, Df_ipiv, Sf_data, Sf_ipiv
-      LB_ALL     = 0x1fu
+      LB_ALL     = 0x1fu,
+      /// Bf_data and Be_data. Not in #LB_ALL: the host assembly fallbacks
+      /// are their only raw writers, and they name it.
+      LB_DIV     = 1u << 5,
+      /// Ae_data, as for #LB_DIV.
+      LB_ELIM    = 1u << 6,
+      /// Every set, for a @a leave that names all but a few.
+      LB_EVERY   = 0x7fu
    };
    void SyncLocalBlocksToHost(unsigned own = LB_ALL,
                               unsigned leave = LB_NONE) const;
+
+   /** @brief Take the sets @a own names to the host before a host loop
+       writes them through raw pointers, and touch nothing else: the other
+       blocks stay where they are, neither downloaded nor invalidated. What
+       DarcyForm's host assembly loops call; see SyncLocalBlocksToHost(). */
+   void TakeLocalBlocksToHost(unsigned own) const
+   { SyncLocalBlocksToHost(own, LB_EVERY & ~own); }
 
    /** @brief Choose how the element-local blocks A and D are factored.
        LocalFactorMode::Serial by default, so nothing existing changes.

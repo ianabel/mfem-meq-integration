@@ -123,6 +123,11 @@ void ParDarcyForm::Assemble(int skip_zeros)
       if (hybridization)
       {
          DenseMatrix elmat;
+         // Host code writing the local blocks through raw pointers, which
+         // DarcyHybridization::ZeroBlocksOnDevice() may have zeroed on the
+         // device: taken first, as in DarcyForm::Assemble().
+         hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_FLUX |
+                                              DarcyHybridization::LB_ELIM);
 
          // Element-wise integration
          for (int i = 0; i < fes_u -> GetNE(); i++)
@@ -163,6 +168,8 @@ void ParDarcyForm::Assemble(int skip_zeros)
       if (hybridization)
       {
          DenseMatrix elmat;
+         // Taken first; see the flux mass.
+         hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_DIV);
 
          // Element-wise integration
          for (int i = 0; i < fes_u -> GetNE(); i++)
@@ -202,6 +209,8 @@ void ParDarcyForm::Assemble(int skip_zeros)
       if (hybridization)
       {
          DenseMatrix elmat;
+         // Taken first; see the flux mass.
+         hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_POT);
 
          // Element-wise integration
          for (int i = 0; i < fes_p -> GetNE(); i++)
@@ -945,6 +954,9 @@ void ParDarcyForm::AssemblePotHDGSharedFaces(int skip_zeros)
    if (hybridization->GetPotConstraintIntegrator() &&
        !hybridization->AssemblePotSharedFaceMatricesBatched())
    {
+      // E, G, H and D, taken first; see DarcyForm::AssemblePotHDGFaces().
+      hybridization->TakeLocalBlocksToHost(DarcyHybridization::LB_FACE |
+                                           DarcyHybridization::LB_POT);
       int nsfaces = pmesh->GetNSharedFaces();
       for (int i = 0; i < nsfaces; i++)
       {

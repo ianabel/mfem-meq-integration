@@ -1112,6 +1112,158 @@ void BdrFluxStep(DarcyHybridization::AssemblyMode am,
    dtr_out.HostRead();
 }
 
+/// DarcyHybridization::SetDefaultAssemblyMode() for one scope, restored on the
+/// way out. Set BEFORE EnableHybridization(), it is what Init() sees, and so
+/// what decides where Init() zeroes the local blocks (ZeroBlocksOnDevice());
+/// SetAssemblyMode() afterwards, as the fixtures above do, comes too late for
+/// that.
+struct DefaultAssemblyScope
+{
+   DarcyHybridization::AssemblyMode saved;
+   explicit DefaultAssemblyScope(DarcyHybridization::AssemblyMode m)
+      : saved(DarcyHybridization::GetDefaultAssemblyMode())
+   { DarcyHybridization::SetDefaultAssemblyMode(m); }
+   ~DefaultAssemblyScope()
+   { DarcyHybridization::SetDefaultAssemblyMode(saved); }
+};
+
+/// The Solve() problem under a default assembly mode, with a potential
+/// diffusion added to the potential mass: the batched element mass takes mass
+/// integrators only, so that pass is the host loop writing D whatever the
+/// mode. With @a flux_host the flux mass and the divergence are handed in a
+/// SumIntegrator, which the batched passes do not take, so those passes are
+/// host loops too -- and then no batched pass ends with a sync before the
+/// potential mass loop, which finds D valid on the device alone. With
+/// @a reassemble the form is assembled, Update()d -- which Reset()s the
+/// hybridization, zeroing the blocks again -- and assembled once more.
+void DefaultModeSolve(DarcyHybridization::AssemblyMode am, bool flux_host,
+                      bool reassemble, Vector &trace, Vector &pot, Vector &flux)
+{
+   DefaultAssemblyScope scope(am);
+   const int n = 4, order = 1, dim = 2;
+   Mesh mesh = Mesh::MakeCartesian2D(n, n, Element::QUADRILATERAL, false,
+                                     0.8, 1.2);
+   L2_FECollection u_coll(order, dim, BasisType::GaussLobatto);
+   L2_FECollection p_coll(order, dim, BasisType::GaussLobatto);
+   DG_Interface_FECollection t_coll(order, dim);
+   FiniteElementSpace Vh(&mesh, &u_coll, dim), Wh(&mesh, &p_coll),
+                      Mh(&mesh, &t_coll);
+
+   ConstantCoefficient one(1.0), src(1.0), small(0.1);
+   DarcyForm darcy(&Vh, &Wh);
+   if (flux_host)
+   {
+      auto *sum = new SumIntegrator;
+      sum->AddIntegrator(new VectorMassIntegrator(one));
+      darcy.GetFluxMassForm()->AddDomainIntegrator(sum);
+   }
+   else
+   {
+      darcy.GetFluxMassForm()->AddDomainIntegrator(
+         new VectorMassIntegrator(one));
+   }
+
+   Array<int> all(mesh.bdr_attributes.Max());
+   all = 1;
+   BilinearForm *M_p = darcy.GetPotentialMassForm();
+   M_p->AddDomainIntegrator(new DiffusionIntegrator(small));
+   auto *fi = new HDGDiffusionIntegrator(one, 1.0);
+   auto *fb = new HDGDiffusionIntegrator(one, 1.0);
+   M_p->AddInteriorFaceIntegrator(fi);
+   M_p->AddBdrFaceIntegrator(fb, all);
+
+   MixedBilinearForm *B = darcy.GetFluxDivForm();
+   if (flux_host)
+   {
+      auto *sum = new SumIntegrator;
+      sum->AddIntegrator(new VectorDivergenceIntegrator());
+      B->AddDomainIntegrator(sum);
+   }
+   else { B->AddDomainIntegrator(new VectorDivergenceIntegrator()); }
+   B->AddInteriorFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-1.0)));
+   B->AddBdrFaceIntegrator(
+      new TransposeIntegrator(new DGNormalTraceIntegrator(-2.0)), all);
+
+   darcy.GetPotentialRHS()->AddDomainIntegrator(new DomainLFIntegrator(src));
+
+   Array<int> ess_flux;
+   darcy.EnableHybridization(&Mh, new NormalTraceJumpIntegrator(), ess_flux);
+   DarcyHybridization *dh = darcy.GetHybridization();
+   REQUIRE(dh->GetAssemblyMode() == am);
+   // The passes this case is about really are the host loops, and the rest
+   // really are kernels.
+   REQUIRE_FALSE(dh->CanBatchPotMass(M_p));
+   const bool batched = (am == DarcyHybridization::AssemblyMode::Batched);
+   REQUIRE(dh->CanBatchFluxMass(darcy.GetFluxMassForm()) ==
+           (batched && !flux_host));
+   REQUIRE(dh->CanBatchDiv(B) == (batched && !flux_host));
+   dh->SetEssentialBC(all);
+   darcy.Assemble();
+   if (reassemble)
+   {
+      darcy.Update();
+      darcy.Assemble();
+   }
+
+   Array<int> offs(4);
+   offs[0] = 0;
+   offs[1] = Vh.GetVSize();
+   offs[2] = Wh.GetVSize();
+   offs[3] = Mh.GetVSize();
+   offs.PartialSum();
+   BlockVector sol(offs), rhs(offs);
+   sol = 0.0;
+   rhs = 0.0;
+   darcy.GetPotentialRHS()->Assemble();
+   rhs.GetBlock(1) += *darcy.GetPotentialRHS();
+   rhs.GetBlock(1).SyncAliasMemory(rhs);
+
+   Vector X, RHS;
+   X.MakeRef(sol, offs[2], Mh.GetVSize());
+   RHS.MakeRef(rhs, offs[2], Mh.GetVSize());
+   BlockVector dsol(sol, darcy.GetOffsets()), drhs(rhs, darcy.GetOffsets());
+   OperatorPtr R;
+   darcy.FormLinearSystem(ess_flux, dsol, drhs, R, X, RHS, true);
+
+   SparseMatrix *H = dynamic_cast<SparseMatrix *>(R.Ptr());
+   REQUIRE(H != nullptr);
+   RHS.HostReadWrite();
+   X.HostReadWrite();
+   UMFPackSolver lin(*H);
+   lin.Mult(RHS, X);
+   BlockVector csol(sol, darcy.GetOffsets());
+   darcy.RecoverFEMSolution(X, csol);
+
+   trace.SetSize(X.Size());
+   trace = X;
+   Vector qv, pv;
+   qv.MakeRef(csol, 0, csol.GetBlock(0).Size());
+   pv.MakeRef(csol, csol.GetBlock(0).Size(), csol.GetBlock(1).Size());
+   pot.SetSize(pv.Size());
+   pot = pv;
+   flux.SetSize(qv.Size());
+   flux = qv;
+   trace.HostRead();
+   pot.HostRead();
+   flux.HostRead();
+}
+
+/// max |a - b| / max |b|, on the host.
+real_t RelMaxDiff(const Vector &a, const Vector &b)
+{
+   REQUIRE(a.Size() == b.Size());
+   const real_t *ha = a.HostRead(), *hb = b.HostRead();
+   real_t d = 0., m = 0.;
+   for (int i = 0; i < a.Size(); i++)
+   {
+      d = std::max(d, std::abs(ha[i] - hb[i]));
+      m = std::max(m, std::abs(hb[i]));
+   }
+   REQUIRE(m > 1e-6);
+   return d / m;
+}
+
 } // namespace darcy_alias
 
 /**
@@ -1199,6 +1351,81 @@ TEST_CASE("DarcyForm/BlockVector alias sync", "[DebugDevice]")
  * j-k-i loop. The debug Device has no GPU_BLAS behind it, so the native
  * backend is what runs.
  */
+/**
+ * @brief The local blocks zeroed on the device, and a host pass writing them.
+ *
+ * Under AssemblyMode::Batched with a device, Init() and Reset() zero the
+ * local blocks where the kernels will write them, and the syncs at the end of
+ * each assembly group only make them readable. A pass that falls back to the
+ * host loop therefore writes into blocks valid only on the device, and has to
+ * take them first (SyncLocalBlocksToHost() with the sets it writes). The
+ * default mode is set before EnableHybridization(), as meq sets it, because
+ * that is what Init() sees.
+ *
+ * Falsified section by section under Device("debug"): without the potential
+ * mass loop's sync the three solve sections abort, and without the flux mass
+ * loop's the second and third do (the first has no host flux pass). The NPC
+ * section takes Finalize()'s device copies of the linear blocks and InvertA()
+ * on both factor modes.
+ */
+TEST_CASE("The local blocks zeroed on the device take a host assembly pass",
+          "[DebugDevice]")
+{
+   using namespace darcy_alias;
+   using AM = DarcyHybridization::AssemblyMode;
+   using LFM = DarcyHybridization::LocalFactorMode;
+   using GM = DarcyHybridization::GradientMode;
+   const real_t tol = 1e-10;
+
+   SECTION("the potential mass on the host, the rest kernels")
+   {
+      Vector tr_ref, p_ref, q_ref, tr, p, q;
+      DefaultModeSolve(AM::Serial, false, false, tr_ref, p_ref, q_ref);
+      DefaultModeSolve(AM::Batched, false, false, tr, p, q);
+      REQUIRE(RelMaxDiff(tr, tr_ref) < tol);
+      REQUIRE(RelMaxDiff(p, p_ref) < tol);
+      REQUIRE(RelMaxDiff(q, q_ref) < tol);
+   }
+   SECTION("the flux mass and the divergence on the host as well")
+   {
+      Vector tr_ref, p_ref, q_ref, tr, p, q;
+      DefaultModeSolve(AM::Serial, true, false, tr_ref, p_ref, q_ref);
+      DefaultModeSolve(AM::Batched, true, false, tr, p, q);
+      REQUIRE(RelMaxDiff(tr, tr_ref) < tol);
+      REQUIRE(RelMaxDiff(p, p_ref) < tol);
+      REQUIRE(RelMaxDiff(q, q_ref) < tol);
+   }
+   SECTION("assembled, reset and assembled again")
+   {
+      Vector tr_ref, p_ref, q_ref, tr, p, q;
+      DefaultModeSolve(AM::Serial, true, false, tr_ref, p_ref, q_ref);
+      DefaultModeSolve(AM::Batched, true, true, tr, p, q);
+      REQUIRE(RelMaxDiff(tr, tr_ref) < tol);
+      REQUIRE(RelMaxDiff(p, p_ref) < tol);
+      REQUIRE(RelMaxDiff(q, q_ref) < tol);
+   }
+   SECTION("an NPC step, factors on the host and batched")
+   {
+      Vector dq_ref, dp_ref, dtr_ref;
+      {
+         DefaultAssemblyScope scope(AM::Serial);
+         NPCStep(LFM::Serial, GM::Assembled, dq_ref, dp_ref, dtr_ref);
+      }
+      for (LFM lfm : {LFM::Serial, LFM::Batched})
+      {
+         Vector dq, dp, dtr;
+         {
+            DefaultAssemblyScope scope(AM::Batched);
+            NPCStep(lfm, GM::Assembled, dq, dp, dtr);
+         }
+         CAPTURE((int)lfm);
+         REQUIRE(RelMaxDiff(dtr, dtr_ref) < tol);
+         REQUIRE(RelMaxDiff(dp, dp_ref) < tol);
+         REQUIRE(RelMaxDiff(dq, dq_ref) < tol);
+      }
+   }
+}
+
 TEST_CASE("Darcy batched local algebra under a device", "[DebugDevice]")
 {
    using namespace darcy_alias;

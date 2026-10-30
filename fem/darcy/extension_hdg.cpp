@@ -126,7 +126,8 @@ namespace
 {
 
 /// What the format resolves of a crossing along a ray of @a length from @a x,
-/// which is where FirstCrossing()'s bisection stops.
+/// which is where FirstCrossing()'s search stops. The name is from when that
+/// search was a bisection.
 real_t BisectionResolution(const Vector &x, real_t length)
 {
    return std::numeric_limits<real_t>::epsilon() * (x.Normlinf() + length);
@@ -140,8 +141,9 @@ real_t CrossingResolution(const Vector &x, real_t length, real_t tol)
    return std::max(tol * length, BisectionResolution(x, length));
 }
 
-/** @brief March from @a x along the unit direction @a dir and bisect the first
-    crossing of the zero level set, returning its parameter in @a t.
+/** @brief March from @a x along the unit direction @a dir and locate the first
+    crossing of the zero level set within the bracket the march finds,
+    returning its parameter in @a t.
 
     Returns false when there is no crossing within @a length -- which is a real
     outcome and not an error: a ray can leave the domain without ever meeting
@@ -166,46 +168,94 @@ bool FirstCrossing(const PositionFunction &phi, const Vector &x,
       return phi(y);
    };
 
-   if (phi_at(0.) > 0.)
+   const real_t phi0 = phi_at(0.);
+   if (phi0 > 0.)
    {
       if (phi_at(-CrossingResolution(x, length, tol)) > 0.) { return false; }
       t = 0.;
       return true;
    }
 
-   real_t ta = 0., tb = -1.;
+   // The last value inside and the first outside, kept for the search below.
+   real_t ta = 0., tb = -1., fa = phi0, fb = 0.;
    const real_t du = length / steps;
    for (int i = 1; i <= steps; i++)
    {
       const real_t u = i * du;
-      if (phi_at(u) > 0.) { tb = u; break; }
-      ta = u;
+      const real_t fu = phi_at(u);
+      if (fu > 0.) { tb = u; fb = fu; break; }
+      ta = u; fa = fu;
    }
    if (tb < 0.) { return false; }
 
-   // BISECT UNTIL THE MIDPOINT STOPS MOVING, WHATEVER tol IS. The endpoint
-   // is differenced along the face when a family has no closed-form
-   // derivative, and a bisection stopped at a bracket of tol * length makes
-   // it a staircase in the face point, with steps up to that bracket: at
-   // 1e-13 times six element sizes, 2.4e-13, which a central difference at a
-   // physical step near 1e-7 turns into an error near 1e-6 in da/dxi. MEQ
-   // measured psi_h moving by 1e-6 to 1e-5 with the step alone at tol =
-   // 1e-13, and by 1e-8 at tol = 0, with no measurable change in wall time.
-   // So tol keeps only its other job, CrossingResolution()'s allowance for an
-   // origin just outside Gamma. In single precision the old bracket target
-   // was below what the format can represent, which is where the midpoint
-   // test came from (MEQ: 27 s of setup against 9 with every ray run to
-   // max_iter); the default max_iter, 100, is ample for double, whose
-   // bisection needs about 45 halvings from a 1/32 bracket.
+   // TO ROUND-OFF IN THE ENDPOINT, WHATEVER tol IS. The endpoint is
+   // differenced along the face when a family has no closed-form derivative,
+   // and a search stopped at a bracket of tol * length makes it a staircase
+   // in the face point, with steps up to that bracket: at 1e-13 times six
+   // element sizes, 2.4e-13, which a central difference at a physical step
+   // near 1e-7 turns into an error near 1e-6 in da/dxi. MEQ measured psi_h
+   // moving by 1e-6 to 1e-5 with the step alone at tol = 1e-13, and by 1e-8
+   // at tol = 0. So tol keeps only its other job, CrossingResolution()'s
+   // allowance for an origin just outside Gamma, and the search stops at
+   // BisectionResolution(): the spacing of the floats near the endpoint
+   // x + t dir, below which the computed sign of phi is round-off and a
+   // narrower bracket only picks a point inside the same band.
+   //
+   // **Brent's method, and it was a bisection.** The bisection ran until its
+   // midpoint stopped moving, about 45 halvings from a 1/32 bracket in
+   // double, which resolves t to its own ulps: finer than the endpoint can
+   // be, and every halving a call of the caller's level set. MEQ profiled a
+   // form build on their ff3 case (102,840 triangles, VertexConePath): 18,127
+   // crossings took 38.5 bisection steps each against 13.9 march steps, and
+   // the level set evaluated there was 12% of the build. Brent keeps the
+   // bracket, so it cannot do worse than bisection by more than a constant,
+   // and on a smooth level set it converges superlinearly to the same
+   // resolution. The stop is in the bracket's width, so in single precision
+   // it arrives with the format's resolution and no extra test.
+   const real_t eps = std::numeric_limits<real_t>::epsilon();
+   const real_t res = BisectionResolution(x, length);
+   real_t a = ta, b = tb, c = tb, fc = fb, d = tb - ta, e = d;
    for (int it = 0; it < max_iter; it++)
    {
-      const real_t tm = 0.5 * (ta + tb);
-      if (tm <= ta || tm >= tb) { break; }
-      if (phi_at(tm) > 0.) { tb = tm; }
-      else { ta = tm; }
+      if ((fb > 0.) == (fc > 0.)) { c = a; fc = fa; d = e = b - a; }
+      if (std::abs(fc) < std::abs(fb))
+      {
+         a = b; b = c; c = a;
+         fa = fb; fb = fc; fc = fa;
+      }
+      const real_t tol1 = 2. * eps * std::abs(b) + 0.5 * res;
+      const real_t xm = 0.5 * (c - b);
+      if (std::abs(xm) <= tol1 || fb == 0.) { break; }
+      if (std::abs(e) >= tol1 && std::abs(fa) > std::abs(fb))
+      {
+         // Inverse quadratic interpolation, or the secant when a == c.
+         const real_t s = fb / fa;
+         real_t p, q;
+         if (a == c)
+         {
+            p = 2. * xm * s;
+            q = 1. - s;
+         }
+         else
+         {
+            const real_t qq = fa / fc, r = fb / fc;
+            p = s * (2. * xm * qq * (qq - r) - (b - a) * (r - 1.));
+            q = (qq - 1.) * (r - 1.) * (s - 1.);
+         }
+         if (p > 0.) { q = -q; }
+         p = std::abs(p);
+         const real_t min1 = 3. * xm * q - std::abs(tol1 * q);
+         const real_t min2 = std::abs(e * q);
+         if (2. * p < std::min(min1, min2)) { e = d; d = p / q; }
+         else { d = xm; e = d; }
+      }
+      else { d = xm; e = d; }
+      a = b; fa = fb;
+      b += (std::abs(d) > tol1) ? d : std::copysign(tol1, xm);
+      fb = phi_at(b);
    }
 
-   t = 0.5 * (ta + tb);
+   t = b;
    return true;
 }
 
