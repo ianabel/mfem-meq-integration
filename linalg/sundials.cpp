@@ -460,10 +460,19 @@ void SundialsNVector::_SetDataAndSize_()
       {
          real_t *h_ptr = SUN_Hip_OR_Cuda(N_VGetHostArrayPointer)(local_x);
          real_t *d_ptr = SUN_Hip_OR_Cuda(N_VGetDeviceArrayPointer)(local_x);
-         const bool known = mm.IsKnown(h_ptr);
          size = SUN_Hip_OR_Cuda(N_VGetLength)(local_x);
+         // This Wrap() REGISTERS h_ptr whether or not it is already known,
+         // and the memory manager counts a repeated registration (see
+         // internal::Memory::counter). The count is returned by Delete(),
+         // which reaches Erase() only while OWNS_INTERNAL is set, so the
+         // flag must stay even when another Memory owns h_ptr. Wrap() with
+         // own = false has already cleared OWNS_HOST and OWNS_DEVICE.
+         // ClearOwnerFlags() here once stripped OWNS_INTERNAL as well, so
+         // every N_Vector callback (KINSOL's residual, for one) left one
+         // count behind. The entry then outlived the buffer, and a later
+         // allocation at the same address inherited its smaller device
+         // buffer: an out-of-bounds kernel, or "invalid alias".
          data.Wrap(h_ptr, d_ptr, size, Device::GetHostMemoryType(), false, false, true);
-         if (known) { data.ClearOwnerFlags(); }
          UseDevice(true);
          break;
       }

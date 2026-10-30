@@ -1,8 +1,8 @@
 # mfem-meq-integration — a flattened snapshot, not a fork
 
 This tree is **MFEM 4.10.1 as MEQ builds against it**: the source of branch
-`meq-integration` at `9d57974336b09ecf2a3282ff2d59ecca960d1106`
-(2026-10-28), exported with `git archive`. Each commit here is one such snapshot,
+`meq-integration` at `6e1cc66618826f03c719325465c6bc42911191cd`
+(2026-10-29), exported with `git archive`. Each commit here is one such snapshot,
 whole, with no MFEM history; a clone fast-forwards from one to the next.
 `.github/` is left out, so that GitHub does not run MFEM's CI here.
 
@@ -25,7 +25,7 @@ whole, with no MFEM history; a clone fast-forwards from one to the next.
     gf-hdg-subdomains-dev                  2bed225310
     gf-interp-hdg-dev                      0c25527ba6
     intrules-triangle-high-order           c6693d5f09
-    memory-manager-registration-refcount   19e59e5cea
+    memory-manager-registration-refcount   25c7e16d61
     pardiso-device-host-sync               9a4ccc4945
     pardiso-multi-rhs                      3f788f9068
     pardiso-refinement-control             14ec0e2fd9

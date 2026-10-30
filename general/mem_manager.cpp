@@ -181,16 +181,38 @@ struct Memory
    /// better: the holder's Delete() erased an entry it did not create. A leak
    /// for a corruption is the trade the aliases map already made.
    ///
-   /// **That cost was then audited over the whole library rather than left as
-   /// a caveat, and no path in MFEM pays it.** The audit is cheap to redo and
-   /// turns on one observation: a count above 1 arises ONLY where a Memory
-   /// was lazily registered at an address another Memory had already
-   /// registered -- Register_ is reached from MakeAlias's "Register 'base'"
-   /// branch, from SetDeviceMemoryType(), and from the device-class arms of
-   /// Read/Write/ReadWrite, and each fires only on a holder whose own flags
-   /// say NOT Registered. A holder that owns its buffer registers at
-   /// allocation and is counted once. So a counter of 2 is always a raw wrap
-   /// of somebody else's address, which is a short-lived local view.
+   /// **That cost was then audited over the whole library, and the audit
+   /// claimed that no path in MFEM pays it. That claim was WRONG**: it
+   /// covered Reset() and missed ClearOwnerFlags(), which a path did pay
+   /// (the last paragraph below). The audit turns on one observation: a
+   /// count above 1 arises ONLY where a Memory registers an address another
+   /// Memory has already registered. There are two ways to do that:
+   ///
+   ///   - LAZILY: Register_ is reached from MakeAlias's "Register 'base'"
+   ///     branch, from SetDeviceMemoryType(), and from the device-class arms
+   ///     of Read/Write/ReadWrite. Each fires only on a holder whose own
+   ///     flags say NOT Registered.
+   ///   - EAGERLY: the two-pointer Memory<T>::Wrap() (Register2_), and the
+   ///     one-pointer Wrap() given a device memory type. These register
+   ///     unconditionally, whatever the address's state.
+   ///
+   /// A holder that owns its buffer registers at allocation and is counted
+   /// once. So a counter of 2 is always a wrap of somebody else's address.
+   ///
+   /// **The count comes back only through Delete_(), and only while the
+   /// holder's flags carry OWNS_INTERNAL.** So any registering wrap that is
+   /// followed by ClearOwnerFlags() leaks one count per wrap.
+   /// SundialsNVector's CUDA/HIP arm did exactly that: on every N_Vector
+   /// callback it wrapped h_ptr eagerly and then, if h_ptr was known,
+   /// cleared all the owner flags. meq's KINSOL Picard loop left 116 counts
+   /// on one vector. The entry outlived the buffer, and a later allocation
+   /// at the address inherited its 24 KB device buffer for 47 KB of data:
+   /// an illegal address in the next kernel, or "invalid alias" in
+   /// InsertAlias(). The arm now keeps OWNS_INTERNAL.
+   ///
+   /// Every other ClearOwnerFlags() in the library follows a STRUCT COPY
+   /// (`I = mat.I`, `dst = src`), which registers nothing. The copy holds no
+   /// count, so it must not return one, and those sites are right.
    ///
    /// Every Memory<T>::Reset() in the library then falls into one of three
    /// groups, none of which can drop such a view:
@@ -219,9 +241,10 @@ struct Memory
    /// `data.MakeAlias(pdata, 0, size)`), so it is the aliases map's counter
    /// that governs it, and that map has always been reference-counted.
    ///
-   /// The residual risk is therefore a FUTURE caller, not a present one: a
-   /// raw wrap of a registered address that is Reset() rather than destroyed
-   /// would leak an entry silently. That is the safer direction and it is the
+   /// The residual risk is a FUTURE caller: a wrap of a registered address
+   /// that is Reset() rather than destroyed, or whose OWNS_INTERNAL is
+   /// cleared, leaks an entry silently. The SUNDIALS case shows that silence
+   /// means "until the address is reused at a larger size". That is the safer direction and it is the
    /// direction the aliases map has been in since it was written.
    size_t counter;
    Memory(void *p, size_t b, MemoryType h, MemoryType d):

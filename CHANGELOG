@@ -63,7 +63,9 @@ Bug fixes
   live, correctly registered buffer, and it was visible only where the host
   memory type is not MemoryType::HOST, i.e. under Device("debug"). The
   memories map now carries the same reference count the aliases map has always
-  had.
+  had. SundialsNVector's CUDA/HIP wrap of an N_Vector keeps OWNS_INTERNAL so
+  that it returns its count. Clearing it left one count per SUNDIALS callback,
+  and the entry then outlived the buffer.
 
 - The SUNDIALS integration now supports single precision. Every floating-point
   type in linalg/sundials.{hpp,cpp} is real_t, so CVODE, CVODES, ARKODE and
